@@ -503,39 +503,19 @@ impl Calendar {
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2"
-))]
-#[path = "indexed_rows.rs"]
-mod indexed_rows;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2"
-))]
-pub use indexed_rows::RowWindows;
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2"
-)))]
-pub type RowWindows<'a, const N: usize> = SingleRowWindows<'a, N>;
-
 /// A row-oriented scanner that extracts every field boundary from two masks.
 /// Fixed-width loads are only used when the complete load is inside the shard.
-pub struct SingleRowWindows<'a, const N: usize> {
+pub struct RowWindows<'a, const N: usize> {
     remaining: &'a [u8],
 }
 
-impl<'a, const N: usize> SingleRowWindows<'a, N> {
+impl<'a, const N: usize> RowWindows<'a, N> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { remaining: bytes }
     }
 }
 
-impl<'a, const N: usize> Iterator for SingleRowWindows<'a, N> {
+impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
     type Item = [&'a [u8]; N];
 
     #[inline(always)]
@@ -556,41 +536,30 @@ impl<'a, const N: usize> Iterator for SingleRowWindows<'a, N> {
                     let boundaries = commas | (1 << end);
                     let starts = (commas << 1) | 1;
                     let ends = boundaries >> 1;
-                    if quotes & !(starts | ends) != 0 {
+                    if quotes & !(starts ^ ends) != 0 {
+                        continue;
+                    }
+                    // Compare opening and closing flags in field order.
+                    let opened = extract_bits(quotes, starts);
+                    if opened != extract_bits(quotes << 1, boundaries) {
                         continue;
                     }
                     let mut start = 0;
-                    let mut output = [&[][..]; N];
-                    let mut valid = true;
-                    for (index, field) in output.iter_mut().enumerate() {
-                        let end = if index + 1 == N {
+                    return Some(std::array::from_fn(|i| {
+                        let stop = if i + 1 == N {
                             end
                         } else {
-                            let place = commas.trailing_zeros() as usize;
+                            let stop = commas.trailing_zeros() as usize;
                             commas &= commas - 1;
-                            place
+                            stop
                         };
-                        let raw = &bytes[start..end];
-                        if !raw.is_empty() && raw[0] == b'"' {
-                            if raw.len() < 2 || raw[raw.len() - 1] != b'"' {
-                                valid = false;
-                                break;
-                            }
-                            // An adjacent delimiter can make an interior position
-                            // eligible in other fields, so keep validation local here.
-                            *field = &raw[1..raw.len() - 1];
-                        } else if raw.last() == Some(&b'"') {
-                            valid = false;
-                            break;
-                        } else {
-                            *field = raw;
-                        }
-                        start = end + 1;
-                    }
-                    if valid {
-                        return Some(output);
-                    }
-                    continue;
+                        let trim = ((opened >> i) & 1) as usize;
+                        // The mask gave N increasing boundaries before the
+                        // newline. A quoted field has two distinct quote bytes.
+                        let field = unsafe { bytes.get_unchecked(start + trim..stop - trim) };
+                        start = stop + 1;
+                        field
+                    }));
                 }
             }
             let row = if let Some(end) = memchr(b'\n', bytes) {
@@ -604,6 +573,29 @@ impl<'a, const N: usize> Iterator for SingleRowWindows<'a, N> {
             }
         }
         None
+    }
+}
+
+#[inline(always)]
+fn extract_bits(word: u128, mask: u128) -> u128 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        use std::arch::x86_64::_pext_u64;
+        let low = mask as u64;
+        u128::from(_pext_u64(word as u64, low))
+            | (u128::from(_pext_u64((word >> 64) as u64, (mask >> 64) as u64)) << low.count_ones())
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut mask = mask;
+        let mut result = 0;
+        let mut target = 1;
+        while mask != 0 {
+            result |= u128::from(word & (mask & mask.wrapping_neg()) != 0) * target;
+            mask &= mask - 1;
+            target <<= 1;
+        }
+        result
     }
 }
 
