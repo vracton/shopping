@@ -14,6 +14,9 @@ use crate::Result;
 use crate::aggregate::{CampaignStats, Daily, UserDay, UserId};
 use crate::catalog::Catalog;
 
+#[path = "output_pages.rs"]
+mod pages;
+
 fn user_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
@@ -51,7 +54,8 @@ fn file_writer(
     let properties = WriterProperties::builder()
         .set_compression(compression)
         .set_max_row_group_row_count(Some(row_group));
-    let properties = if std::env::var_os("SHOPPING_WRITER").is_some_and(|v| v == "simple") {
+    let mode = std::env::var("SHOPPING_WRITER").unwrap_or_default();
+    let properties = if matches!(mode.as_str(), "simple" | "pages") {
         properties
             .set_statistics_enabled(EnabledStatistics::None)
             .set_offset_index_disabled(true)
@@ -113,6 +117,11 @@ fn write_user_part(
     catalog: &Catalog<'_>,
     row_group: usize,
 ) -> Result<()> {
+    if std::env::var_os("SHOPPING_WRITER").is_some_and(|mode| mode == "pages")
+        && pages::try_write(path, partitions, catalog, row_group)?
+    {
+        return Ok(());
+    }
     let schema = user_schema();
     let mut writer = file_writer(path, Arc::clone(&schema), row_group)?;
     for rows in partitions
