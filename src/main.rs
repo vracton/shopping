@@ -1,5 +1,6 @@
 mod aggregate;
 mod catalog;
+mod fast_time;
 mod ingest;
 mod input;
 mod output;
@@ -131,9 +132,11 @@ fn run(config: &Config) -> Result<()> {
         || read_shards(&config.data.join("clicks"), buffered),
     );
     let (event_maps, click_maps) = (event_maps?, click_maps?);
+    stages.mark("open_and_map");
     let event_chunks = chunks(&event_maps, config.chunk_bytes);
     let click_chunks = chunks(&click_maps, config.chunk_bytes);
-    stages.mark("setup");
+    let link_chunks = chunks(&links, config.chunk_bytes);
+    stages.mark("chunk_boundaries");
     if matches!(
         config.architecture,
         Architecture::Packed | Architecture::Indexed
@@ -146,15 +149,19 @@ fn run(config: &Config) -> Result<()> {
         if let Some(parsed) = packed::parse_inputs(
             &event_chunks,
             &click_chunks,
-            links.iter().map(|mapping| &mapping[..]),
+            &links.iter().map(|mapping| &mapping[..]).collect::<Vec<_>>(),
+            &link_chunks,
             &catalog,
             window.clone(),
-            config.partitions,
-            config.dedup_partitions,
-            matches!(config.architecture, Architecture::Indexed),
+            packed::PackedPlan {
+                partitions: config.partitions,
+                dedup_partitions: config.dedup_partitions,
+                indexed: matches!(config.architecture, Architecture::Indexed),
+                profile: stages.enabled(),
+            },
         ) {
             stages.mark("packed_parse_and_links");
-            drop((event_chunks, click_chunks));
+            drop((event_chunks, click_chunks, link_chunks));
             let ((), daily) = rayon::join(
                 || drop((event_maps, click_maps, links)),
                 || {
@@ -175,6 +182,8 @@ fn run(config: &Config) -> Result<()> {
                 config.parquet_rows,
             )?;
             stages.mark("parquet");
+            drop(daily);
+            stages.mark("drop_aggregates");
             return Ok(());
         }
     }

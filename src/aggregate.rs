@@ -143,11 +143,57 @@ fn day(ts: i64) -> i32 {
     ts.div_euclid(DAY_MS) as i32
 }
 
+// With this width any two timestamps in one bin are at most one
+// session gap apart. Only the gap from one nonempty bin to the next matters.
+const BIN_MS: usize = SESSION_GAP_MS as usize + 1;
+
+#[derive(Clone, Copy, Default)]
+struct TimeBin {
+    start: u32,
+    end: u32,
+    count: u32,
+    revenue: i64,
+    last_purchase: u32,
+}
+
+#[derive(Default)]
+struct TimeBins {
+    slots: Vec<TimeBin>,
+    used: Vec<u64>,
+    purchases: Vec<(u32, u32, u32)>,
+}
+
+impl TimeBins {
+    fn add(&mut self, ts: u32, (price, category): (u32, u32)) {
+        let index = ts as usize / BIN_MS;
+        if index >= self.slots.len() {
+            self.slots.resize(index + 1, TimeBin::default());
+            self.used.resize(index / 64 + 1, 0);
+        }
+        let slot = &mut self.slots[index];
+        if slot.count == 0 {
+            slot.start = ts;
+            slot.end = ts;
+            self.used[index / 64] |= 1 << (index % 64);
+        } else {
+            slot.start = slot.start.min(ts);
+            slot.end = slot.end.max(ts);
+        }
+        slot.count += 1;
+        if price != 0 {
+            slot.revenue += i64::from(price);
+            self.purchases.push((price, category, slot.last_purchase));
+            slot.last_purchase = self.purchases.len() as u32;
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Person {
     sessions: Vec<Session>,
     categories: FxHashMap<u32, i64>,
     intervals: FxHashMap<usize, (i64, i64)>,
+    bins: TimeBins,
 }
 
 impl Person {
@@ -200,18 +246,86 @@ impl Person {
         finish_user_day(&mut totals, &mut self.categories);
         output.users.push(totals);
 
+        self.finish_campaigns(clicks, organic, &mut output.campaigns);
+    }
+
+    pub fn aggregate_binned<'a>(
+        &mut self,
+        user: UserId<'a>,
+        events: &[impl TimedEvent],
+        clicks: &[impl TimedClick],
+        organic: usize,
+        base: i64,
+        output: &mut Daily<'a>,
+    ) {
+        self.sessions.clear();
+        self.bins.purchases.clear();
+        for event in events {
+            self.bins.add(event.timestamp() as u32, event.purchase());
+        }
+
+        let mut previous_end = -SESSION_GAP_MS - 1;
+        let mut session: Option<Session> = None;
+        let mut totals: Option<UserDay<'a>> = None;
+        for (word_index, word) in self.bins.used.iter_mut().enumerate() {
+            let mut bits = std::mem::take(word);
+            while bits != 0 {
+                let index = word_index * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let cell = std::mem::take(&mut self.bins.slots[index]);
+                let start = i64::from(cell.start);
+                if start - previous_end > SESSION_GAP_MS {
+                    if let Some(previous) = session.take() {
+                        self.sessions.push(previous);
+                    }
+                    let session_day = day(start + base);
+                    if totals.as_ref().is_none_or(|row| row.day != session_day) {
+                        if let Some(mut previous) = totals.take() {
+                            finish_user_day(&mut previous, &mut self.categories);
+                            output.users.push(previous);
+                        }
+                        totals = Some(new_user_day(user, session_day));
+                    }
+                    totals.as_mut().unwrap().sessions += 1;
+                    session = Some(Session {
+                        start,
+                        day: session_day,
+                        revenue: 0,
+                    });
+                }
+                let user_day = totals.as_mut().unwrap();
+                user_day.events += i64::from(cell.count);
+                user_day.revenue += cell.revenue;
+                session.as_mut().unwrap().revenue += cell.revenue;
+                let mut purchase = cell.last_purchase;
+                while purchase != 0 {
+                    let (price, category, next) = self.bins.purchases[purchase as usize - 1];
+                    *self.categories.entry(category).or_default() += i64::from(price);
+                    purchase = next;
+                }
+                previous_end = i64::from(cell.end);
+            }
+        }
+        let mut totals = totals.unwrap();
+        finish_user_day(&mut totals, &mut self.categories);
+        output.users.push(totals);
+        self.sessions.push(session.unwrap());
+        self.finish_campaigns(clicks, organic, &mut output.campaigns);
+    }
+
+    fn finish_campaigns(
+        &mut self,
+        clicks: &[impl TimedClick],
+        organic: usize,
+        totals: &mut CampaignDaily,
+    ) {
         if clicks.is_empty() {
             for session in &self.sessions {
-                add_credit(session, organic, &mut output.campaigns);
+                add_credit(session, organic, totals);
             }
         } else {
-            credit(&self.sessions, clicks, organic, &mut output.campaigns);
-            assist(
-                &self.sessions,
-                clicks,
-                &mut self.intervals,
-                &mut output.campaigns,
-            );
+            credit(&self.sessions, clicks, organic, totals);
+            assist(&self.sessions, clicks, &mut self.intervals, totals);
         }
     }
 }
@@ -358,6 +472,68 @@ pub fn split_ordered<'a, 'b>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unordered_time_bins_match_sorted_sessions_and_campaigns() {
+        let mut state = 19_u64;
+        let mut sample = |limit| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 32) % limit
+        };
+        let mut first = Person::default();
+        let mut second = Person::default();
+        for round in 0..160_u64 {
+            let mut events: Vec<_> = (0..round + 1)
+                .map(|_| {
+                    let ts = (sample(144) as i64 * SESSION_GAP_MS) + sample(3) as i64 - 1;
+                    Event {
+                        user: b"u",
+                        ts: ts.max(0),
+                        price: sample(2) as u32 * 500,
+                        category: sample(5) as u32,
+                    }
+                })
+                .collect();
+            let mut clicks: Vec<_> = (0..round % 30)
+                .map(|_| Click {
+                    user: b"u",
+                    id: b"k",
+                    ts: sample(3 * 24 * 60) as i64 * 60_000,
+                    campaign: sample(5) as usize,
+                })
+                .collect();
+            clicks.sort_unstable_by_key(|click| click.ts);
+            let mut unordered = Daily::default();
+            let mut sorted = Daily::default();
+            let base = DAY_MS * 25;
+            first.aggregate_binned(
+                UserId::Bytes(b"u"),
+                &events,
+                &clicks,
+                5,
+                base,
+                &mut unordered,
+            );
+            events.sort_unstable_by_key(|event| event.ts);
+            second.aggregate(UserId::Bytes(b"u"), &events, &clicks, 5, base, &mut sorted);
+            let summarize = |out: &Daily| {
+                out.users
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.day,
+                            row.sessions,
+                            row.events,
+                            row.revenue,
+                            row.top_category,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(summarize(&unordered), summarize(&sorted), "round {round}");
+            assert_eq!(unordered.campaigns, sorted.campaigns, "round {round}");
+        }
+    }
 
     #[test]
     fn assisted_counts_and_credit_match_direct_search_under_perturbation() {

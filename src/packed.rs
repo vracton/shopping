@@ -6,6 +6,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::aggregate::{CampaignDaily, Daily, Person, TimedClick, TimedEvent, UserId};
 use crate::catalog::Catalog;
+use crate::fast_time::FastTime;
 use crate::input::{Calendar, ChunkRows, DAY_MS, RowWindows, WEEK_MS, data_rows, decimal, fields};
 use crate::stages::Stages;
 
@@ -72,7 +73,7 @@ impl Key {
 }
 
 struct Links {
-    ids: FxHashMap<Key, usize>,
+    ids: FxHashMap<Key, Key>,
     parents: Vec<usize>,
     sizes: Vec<usize>,
     names: Vec<Key>,
@@ -80,13 +81,16 @@ struct Links {
 
 impl Links {
     fn intern(&mut self, name: Key) -> usize {
-        *self.ids.entry(name).or_insert_with(|| {
-            let index = self.names.len();
-            self.names.push(name);
-            self.parents.push(index);
-            self.sizes.push(1);
-            index
-        })
+        self.ids
+            .entry(name)
+            .or_insert_with(|| {
+                let index = self.names.len();
+                self.names.push(name);
+                self.parents.push(index);
+                self.sizes.push(1);
+                Key(index as u64)
+            })
+            .0 as usize
     }
 
     fn root(parents: &mut [usize], mut index: usize) -> usize {
@@ -122,15 +126,131 @@ impl Links {
             }
         }
         for index in links.ids.values_mut() {
-            *index = Self::root(&mut links.parents, *index);
+            *index = links.names[Self::root(&mut links.parents, index.0 as usize)];
         }
         links.parents = Vec::new();
         links.sizes = Vec::new();
+        links.names = Vec::new();
         Some(links)
     }
 
     fn resolve(&self, key: Key) -> Key {
-        self.ids.get(&key).map_or(key, |&index| self.names[index])
+        self.ids.get(&key).copied().unwrap_or(key)
+    }
+}
+
+enum Aliases {
+    Serial(Links),
+    Sharded(Vec<FxHashMap<Key, Key>>),
+}
+
+impl Aliases {
+    fn resolve(&self, key: Key) -> Key {
+        match self {
+            Self::Serial(links) => links.resolve(key),
+            Self::Sharded(parts) => parts[bucket(key, parts.len())]
+                .get(&key)
+                .copied()
+                .unwrap_or(key),
+        }
+    }
+
+    fn parallel(chunks: &[&[u8]]) -> Option<Self> {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+        const PARTS: usize = 32;
+        let edges: Vec<Vec<(Key, Key)>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut edges = Vec::with_capacity(chunk.len() / 20);
+                for [a, b] in RowWindows::<2>::new(chunk) {
+                    if !a.is_empty() && !b.is_empty() {
+                        edges.push((Key::pack(a)?, Key::pack(b)?));
+                    }
+                }
+                Some(edges)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let names: Vec<Vec<Vec<Key>>> = edges
+            .par_iter()
+            .map(|part| {
+                let mut names = buckets(PARTS);
+                for &(a, b) in part {
+                    names[bucket(a, PARTS)].push(a);
+                    names[bucket(b, PARTS)].push(b);
+                }
+                names
+            })
+            .collect();
+        let local: Vec<_> = transpose(names, PARTS)
+            .into_par_iter()
+            .map(|part| {
+                let mut names = flatten(part);
+                names.sort_unstable();
+                names.dedup();
+                names
+            })
+            .collect();
+        let mut offsets = Vec::with_capacity(PARTS);
+        let mut total = 0_usize;
+        for part in &local {
+            offsets.push(total);
+            total += part.len();
+        }
+        let limit = u32::try_from(total).ok()?;
+        let indices: Vec<FxHashMap<Key, u32>> = local
+            .par_iter()
+            .zip(offsets)
+            .map(|(part, base)| {
+                part.iter()
+                    .enumerate()
+                    .map(|(offset, &key)| (key, (base + offset) as u32))
+                    .collect()
+            })
+            .collect();
+        let names = flatten(local);
+        let parent: Vec<_> = (0..limit).map(AtomicU32::new).collect();
+        let root = |mut node: u32| {
+            loop {
+                let next = parent[node as usize].load(Relaxed);
+                if next == node {
+                    break node;
+                }
+                node = next;
+            }
+        };
+        let index = |key| indices[bucket(key, PARTS)][&key];
+        edges.par_iter().for_each(|part| {
+            for &(left, right) in part {
+                let (mut a, mut b) = (index(left), index(right));
+                loop {
+                    a = root(a);
+                    b = root(b);
+                    if a == b {
+                        break;
+                    }
+                    // Every successful join points to a strictly smaller byte key.
+                    if names[a as usize] < names[b as usize] {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    if parent[a as usize]
+                        .compare_exchange_weak(a, b, Relaxed, Relaxed)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let output = indices
+            .into_par_iter()
+            .map(|part| {
+                part.into_iter()
+                    .map(|(key, index)| (key, names[root(index) as usize]))
+                    .collect()
+            })
+            .collect();
+        Some(Self::Sharded(output))
     }
 }
 
@@ -182,9 +302,19 @@ struct Parser<'a, 'b> {
     start: i64,
     calendar: Calendar,
     cutoff_days: Vec<u64>,
+    fast_time: Option<FastTime>,
 }
 
 impl Parser<'_, '_> {
+    #[inline]
+    fn timestamp(&self, bytes: &[u8]) -> Option<i64> {
+        if let Some(fast) = &self.fast_time {
+            fast.timestamp(bytes, &self.calendar)
+        } else {
+            self.calendar.timestamp(bytes)
+        }
+    }
+
     fn event(
         &self,
         [id, user, ts, ingest, kind, product, price]: [&[u8]; 7],
@@ -193,7 +323,12 @@ impl Parser<'_, '_> {
             return Some(None);
         }
         let event = Key::pack(id)?;
-        let Some(ingest) = Calendar::ingest_code(ingest) else {
+        let code = if self.fast_time.is_some() {
+            FastTime::ingest(ingest)
+        } else {
+            Calendar::ingest_code(ingest)
+        };
+        let Some(ingest) = code else {
             return Some(None);
         };
         let mut candidate = Candidate {
@@ -206,16 +341,20 @@ impl Parser<'_, '_> {
             return Some(Some(candidate));
         }
         let Some(ts) = self
-            .calendar
             .timestamp(ts)
             .filter(|&t| self.start <= t && t < self.end)
         else {
             return Some(Some(candidate));
         };
         let relative = (ts - self.base) as u32;
-        let cutoff = self.cutoff_days[(relative / DAY_MS as u32 + 1) as usize]
-            | u64::from((relative % DAY_MS as u32) / 1000);
-        if ingest > cutoff {
+        let late = if let Some(fast) = &self.fast_time {
+            fast.is_late(ingest, relative)
+        } else {
+            let cutoff = self.cutoff_days[(relative / DAY_MS as u32 + 1) as usize]
+                | u64::from((relative % DAY_MS as u32) / 1000);
+            ingest > cutoff
+        };
+        if late {
             return Some(Some(candidate));
         }
         candidate.purchase = match kind {
@@ -239,7 +378,6 @@ impl Parser<'_, '_> {
             return Some(None);
         }
         let Some(ts) = self
-            .calendar
             .timestamp(ts)
             .filter(|&t| self.base <= t && t < self.end)
         else {
@@ -291,7 +429,8 @@ fn parse<T: Send, const N: usize>(
     let partial = chunks
         .par_chunks(group_size)
         .map(|chunks| {
-            let mut output = buckets(count);
+            let capacity = chunks.iter().map(|bytes| bytes.len()).sum::<usize>() / 74 / count;
+            let mut output: Vec<_> = (0..count).map(|_| Vec::with_capacity(capacity)).collect();
             for chunk in chunks {
                 let mut push = |row| {
                     if let Some(item) = parse(row)? {
@@ -315,7 +454,7 @@ fn parse<T: Send, const N: usize>(
     Some(transpose(partial, count))
 }
 
-fn dedup(groups: Vec<Vec<Candidate>>, links: &Links, count: usize) -> Vec<Vec<Event>> {
+fn dedup(groups: Vec<Vec<Candidate>>, links: &Aliases, count: usize) -> Vec<Vec<Event>> {
     let rows: usize = groups.iter().map(Vec::len).sum();
     let mut output = buckets(count);
     if rows == 0 {
@@ -345,7 +484,11 @@ fn dedup(groups: Vec<Vec<Candidate>>, links: &Links, count: usize) -> Vec<Vec<Ev
 
 /// Store only a fingerprint and a row coordinate in the dedup table.
 /// The first pass marks losers in place. The second reads winners sequentially.
-fn dedup_indexed(mut groups: Vec<Vec<Candidate>>, links: &Links, count: usize) -> Vec<Vec<Event>> {
+fn dedup_indexed(
+    mut groups: Vec<Vec<Candidate>>,
+    links: &Aliases,
+    count: usize,
+) -> Vec<Vec<Event>> {
     const ROW_BITS: u32 = 20;
     const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
     if groups.len() >= (1 << (32 - ROW_BITS))
@@ -398,7 +541,81 @@ fn dedup_indexed(mut groups: Vec<Vec<Candidate>>, links: &Links, count: usize) -
     output
 }
 
-fn route(rows: impl Iterator<Item = Candidate>, links: &Links, output: &mut [Vec<Event>]) {
+/// An exact duplicate filter. A clear collision bit proves a row's hash
+/// position was used once. Every ambiguous row still gets full-key dedup.
+fn dedup_filtered(
+    mut groups: Vec<Vec<Candidate>>,
+    links: &Aliases,
+    count: usize,
+) -> Vec<Vec<Event>> {
+    const ROW_BITS: u32 = 20;
+    const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
+    if groups.len() >= (1 << (32 - ROW_BITS))
+        || groups.iter().any(|group| group.len() > ROW_MASK as usize)
+    {
+        return dedup(groups, links, count);
+    }
+    let rows: usize = groups.iter().map(Vec::len).sum();
+    let mut output = buckets(count);
+    if rows == 0 {
+        return output;
+    }
+    let words = rows.div_ceil(4).next_power_of_two();
+    let mut occupied = vec![0_u64; words];
+    let mut collisions = vec![0_u64; words];
+    let marker = |hash: u64| (((hash >> 6) as usize) & (words - 1), 1_u64 << (hash & 63));
+    for row in groups.iter().flatten() {
+        let (word, bit) = marker(row.event.hash());
+        let previous = occupied[word];
+        collisions[word] |= previous & bit;
+        occupied[word] = previous | bit;
+    }
+    drop(occupied);
+    let ambiguous: usize = collisions
+        .iter()
+        .map(|word| word.count_ones() as usize)
+        .sum();
+    let mut duplicates = hashbrown::HashTable::with_capacity(ambiguous * 2);
+    for group in 0..groups.len() {
+        for index in 0..groups[group].len() {
+            let row = groups[group][index];
+            let hash = row.event.hash();
+            let (word, bit) = marker(hash);
+            if collisions[word] & bit == 0 {
+                continue;
+            }
+            let read = |location: u32| {
+                &groups[(location >> ROW_BITS) as usize][(location & ROW_MASK) as usize]
+            };
+            let position = ((group as u32) << ROW_BITS) | index as u32;
+            match duplicates.entry(
+                hash,
+                |previous: &u32| read(*previous).event == row.event,
+                |previous| read(*previous).event.hash(),
+            ) {
+                hashbrown::hash_table::Entry::Vacant(entry) => {
+                    entry.insert(position);
+                }
+                hashbrown::hash_table::Entry::Occupied(mut entry) => {
+                    let previous = *entry.get();
+                    let chosen = &mut groups[(previous >> ROW_BITS) as usize]
+                        [(previous & ROW_MASK) as usize];
+                    if row.ingest < chosen.ingest {
+                        chosen.ts = INVALID;
+                        *entry.get_mut() = position;
+                    } else {
+                        groups[group][index].ts = INVALID;
+                    }
+                }
+            }
+        }
+    }
+    drop(duplicates);
+    route(groups.into_iter().flatten(), links, &mut output);
+    output
+}
+
+fn route(rows: impl Iterator<Item = Candidate>, links: &Aliases, output: &mut [Vec<Event>]) {
     // Frequent aliases can bypass the larger catalog table.
     let mut cache = [(Key(0), Key(0)); 1024];
     let count = output.len();
@@ -428,6 +645,7 @@ fn flatten<T>(groups: Vec<Vec<T>>) -> Vec<T> {
     output
 }
 
+#[derive(Clone, Copy)]
 struct TimelineClick {
     ts: u32,
     campaign: u32,
@@ -443,6 +661,7 @@ impl TimedClick for TimelineClick {
     }
 }
 
+#[derive(Clone, Copy)]
 struct TimelineEvent(u64);
 
 impl TimedEvent for TimelineEvent {
@@ -582,6 +801,127 @@ impl TimelineGroups {
     }
 }
 
+/// Count each shopper's records, then write numeric payloads into contiguous
+/// ranges. A range is sorted independently, with no partition-wide key sort.
+#[derive(Default)]
+struct CountedTimelines {
+    ordinals: FxHashMap<Key, usize>,
+    names: Vec<Key>,
+    locations: Vec<usize>,
+    counts: Vec<usize>,
+    click_destinations: Vec<(usize, TimelineClick)>,
+    click_counts: Vec<usize>,
+    cursor: Vec<usize>,
+    click_cursor: Vec<usize>,
+    ordered_events: Vec<TimelineEvent>,
+    ordered_clicks: Vec<TimelineClick>,
+    scratch: Person,
+    bin_min: usize,
+}
+
+fn starts(counts: &[usize], offsets: &mut Vec<usize>) {
+    let mut total = 0;
+    offsets.clear();
+    offsets.extend(counts.iter().map(|&count| {
+        let output = total;
+        total += count;
+        output
+    }));
+}
+
+impl CountedTimelines {
+    fn run(
+        &mut self,
+        (events, clicks): BucketPair,
+        organic: usize,
+        base: i64,
+        out: &mut Daily<'static>,
+    ) {
+        let rows = events.iter().map(Vec::len).sum();
+        self.names.clear();
+        self.ordinals.clear();
+        self.counts.clear();
+        self.locations.clear();
+        self.locations.reserve(rows);
+        self.ordinals.reserve(rows / 24);
+        for event in events.iter().flatten() {
+            let ordinal = *self.ordinals.entry(event.user).or_insert_with(|| {
+                let at = self.names.len();
+                self.names.push(event.user);
+                self.counts.push(0);
+                at
+            });
+            self.counts[ordinal] += 1;
+            self.locations.push(ordinal);
+        }
+        starts(&self.counts, &mut self.cursor);
+        self.ordered_events.resize(rows, TimelineEvent(0));
+        for (event, ordinal) in events
+            .into_iter()
+            .flatten()
+            .zip(self.locations.iter().copied())
+        {
+            let position = &mut self.cursor[ordinal];
+            self.ordered_events[*position] =
+                TimelineEvent((u64::from(event.ts) << 32) | u64::from(event.purchase));
+            *position += 1;
+        }
+        self.click_counts.clear();
+        self.click_counts.resize(self.names.len(), 0);
+        self.click_destinations.clear();
+        for click in clicks.into_iter().flatten() {
+            if let Some(&ordinal) = self.ordinals.get(&click.user) {
+                self.click_counts[ordinal] += 1;
+                self.click_destinations.push((
+                    ordinal,
+                    TimelineClick {
+                        ts: click.ts,
+                        campaign: click.campaign,
+                        id: click.id,
+                    },
+                ));
+            }
+        }
+        starts(&self.click_counts, &mut self.click_cursor);
+        self.ordered_clicks.resize(
+            self.click_destinations.len(),
+            TimelineClick {
+                ts: 0,
+                campaign: 0,
+                id: Key(0),
+            },
+        );
+        for &(ordinal, click) in &self.click_destinations {
+            let position = &mut self.click_cursor[ordinal];
+            self.ordered_clicks[*position] = click;
+            *position += 1;
+        }
+        let (mut event_start, mut click_start) = (0, 0);
+        for (ordinal, &name) in self.names.iter().enumerate() {
+            let event_end = self.cursor[ordinal];
+            let click_end = self.click_cursor[ordinal];
+            let events = &mut self.ordered_events[event_start..event_end];
+            let clicks = &mut self.ordered_clicks[click_start..click_end];
+            clicks.sort_unstable_by_key(|click| (click.ts, click.id));
+            if self.bin_min > 0 && events.len() >= self.bin_min {
+                self.scratch.aggregate_binned(
+                    UserId::Packed(name),
+                    events,
+                    clicks,
+                    organic,
+                    base,
+                    out,
+                );
+            } else {
+                events.sort_unstable_by_key(|event| event.0);
+                self.scratch
+                    .aggregate(UserId::Packed(name), events, clicks, organic, base, out);
+            }
+            (event_start, click_start) = (event_end, click_end);
+        }
+    }
+}
+
 fn aggregate_sorted(
     (events, clicks): BucketPair,
     organic: usize,
@@ -606,22 +946,34 @@ fn aggregate_sorted(
 pub struct Parsed {
     events: Vec<Vec<Vec<Candidate>>>,
     clicks: Vec<Vec<Click>>,
-    links: Links,
+    links: Aliases,
     base: i64,
     first_day: i32,
     days: usize,
 }
 
-pub fn parse_inputs<'a>(
+pub struct PackedPlan {
+    pub partitions: usize,
+    pub dedup_partitions: usize,
+    pub indexed: bool,
+    pub profile: bool,
+}
+
+pub fn parse_inputs(
     events: &[&[u8]],
     clicks: &[&[u8]],
-    link_files: impl Iterator<Item = &'a [u8]> + Send,
+    link_files: &[&[u8]],
+    link_chunks: &[&[u8]],
     catalog: &Catalog<'_>,
     window: Range<i64>,
-    count: usize,
-    dedup_count: usize,
-    indexed: bool,
+    plan: PackedPlan,
 ) -> Option<Parsed> {
+    let PackedPlan {
+        partitions: count,
+        dedup_partitions: dedup_count,
+        indexed,
+        profile,
+    } = plan;
     let base = (window.start - WEEK_MS).div_euclid(DAY_MS) * DAY_MS;
     if !count.is_power_of_two()
         || !dedup_count.is_power_of_two()
@@ -632,12 +984,19 @@ pub fn parse_inputs<'a>(
     }
     let calendar = Calendar::new(window.start);
     let cutoff_days = calendar.cutoff_days(base, window.end, window.start)?;
+    let fast_time =
+        if indexed && std::env::var_os("SHOPPING_CLOCK").is_none_or(|mode| mode != "calendar") {
+            Some(FastTime::new(&calendar, base, window.start, window.end)?)
+        } else {
+            None
+        };
     let parser = Parser {
         catalog,
         base,
         start: window.start,
         calendar,
         cutoff_days,
+        fast_time,
         end: window.end,
     };
     let window_rows =
@@ -646,41 +1005,56 @@ pub fn parse_inputs<'a>(
         || {
             rayon::join(
                 || {
-                    parse(
-                        events,
-                        dedup_count,
-                        window_rows,
-                        |r| parser.event(r),
-                        |item| item.event,
-                    )
+                    Stages::span(profile, "event_decode_and_scatter", || {
+                        parse(
+                            events,
+                            dedup_count,
+                            window_rows,
+                            |r| parser.event(r),
+                            |item| item.event,
+                        )
+                    })
                 },
                 || {
-                    clicks
-                        .par_iter()
-                        .map(|chunk| {
-                            let mut output = Vec::new();
-                            let mut push = |row| {
-                                if let Some(click) = parser.click(row)? {
-                                    output.push(click);
+                    Stages::span(profile, "click_decode", || {
+                        clicks
+                            .par_iter()
+                            .map(|chunk| {
+                                let mut output = Vec::new();
+                                let mut push = |row| {
+                                    if let Some(click) = parser.click(row)? {
+                                        output.push(click);
+                                    }
+                                    Some(())
+                                };
+                                if window_rows {
+                                    for row in RowWindows::new(chunk) {
+                                        push(row)?;
+                                    }
+                                } else {
+                                    for row in ChunkRows::new(chunk) {
+                                        push(row)?;
+                                    }
                                 }
-                                Some(())
-                            };
-                            if window_rows {
-                                for row in RowWindows::new(chunk) {
-                                    push(row)?;
-                                }
-                            } else {
-                                for row in ChunkRows::new(chunk) {
-                                    push(row)?;
-                                }
-                            }
-                            Some(output)
-                        })
-                        .collect::<Option<Vec<_>>>()
+                                Some(output)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
                 },
             )
         },
-        || Links::new(link_files),
+        || {
+            Stages::span(profile, "link_decode_and_union", || {
+                if indexed
+                    && std::env::var_os("SHOPPING_LINKS").as_deref()
+                        == Some(std::ffi::OsStr::new("parallel"))
+                {
+                    Aliases::parallel(link_chunks)
+                } else {
+                    Links::new(link_files.iter().copied()).map(Aliases::Serial)
+                }
+            })
+        },
     );
     Some(Parsed {
         events: events?,
@@ -708,33 +1082,46 @@ impl Parsed {
             first_day,
             days,
         } = self;
-        let choose = if indexed { dedup_indexed } else { dedup };
+        let choose = if !indexed {
+            dedup
+        } else if std::env::var_os("SHOPPING_DEDUP_MODE").as_deref()
+            == Some(std::ffi::OsStr::new("filter"))
+        {
+            dedup_filtered
+        } else {
+            dedup_indexed
+        };
+        let profile = stages.enabled();
         let (events, clicks) = rayon::join(
             || {
-                events
-                    .into_par_iter()
-                    .map(|group| choose(group, &links, count))
-                    .collect()
+                Stages::span(profile, "event_dedup_and_route", || {
+                    events
+                        .into_par_iter()
+                        .map(|group| choose(group, &links, count))
+                        .collect()
+                })
             },
             || {
-                clicks
-                    .into_par_iter()
-                    .map(|group| {
-                        let mut output = buckets(count);
-                        for mut click in group {
-                            click.user = links.resolve(click.user);
-                            output[bucket(click.user, count)].push(click);
-                        }
-                        output
-                    })
-                    .collect()
+                Stages::span(profile, "click_alias_and_route", || {
+                    clicks
+                        .into_par_iter()
+                        .map(|group| {
+                            let mut output = buckets(count);
+                            for mut click in group {
+                                click.user = links.resolve(click.user);
+                                output[bucket(click.user, count)].push(click);
+                            }
+                            output
+                        })
+                        .collect()
+                })
             },
         );
         let events = transpose(events, count);
         let clicks = transpose(clicks, count);
         stages.mark("packed_dedup_and_partition");
         if indexed {
-            let linked = std::env::var_os("SHOPPING_TIMELINES").is_none_or(|value| value != "sort");
+            let mode = std::env::var("SHOPPING_TIMELINES").unwrap_or_else(|_| "counted".into());
             coalesce(events, clicks)
                 .into_par_iter()
                 .map(|job| {
@@ -743,11 +1130,18 @@ impl Parsed {
                         campaigns: CampaignDaily::dense(first_day, days, organic + 1),
                     };
                     let mut grouping = TimelineGroups::default();
+                    let mut counted = CountedTimelines {
+                        bin_min: std::env::var("SHOPPING_BIN_MIN")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(64),
+                        ..CountedTimelines::default()
+                    };
                     for pair in job.buckets {
-                        if linked {
-                            grouping.run(pair, organic, base, &mut daily);
-                        } else {
-                            aggregate_sorted(pair, organic, base, &mut daily);
+                        match mode.as_str() {
+                            "linked" => grouping.run(pair, organic, base, &mut daily),
+                            "sort" => aggregate_sorted(pair, organic, base, &mut daily),
+                            _ => counted.run(pair, organic, base, &mut daily),
                         }
                     }
                     daily

@@ -13,6 +13,20 @@ impl Stages {
         }
     }
 
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn span<T>(enabled: bool, name: &str, body: impl FnOnce() -> T) -> T {
+        if !enabled {
+            return body();
+        }
+        let start = Instant::now();
+        let result = body();
+        eprintln!("overlap {name} {:.6}", start.elapsed().as_secs_f64());
+        result
+    }
+
     pub fn mark(&mut self, name: &str) {
         if self.enabled {
             let now = Instant::now();

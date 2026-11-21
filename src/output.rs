@@ -42,8 +42,14 @@ fn file_writer(
     schema: SchemaRef,
     row_group: usize,
 ) -> Result<ArrowWriter<BufWriter<File>>> {
+    let compression =
+        if std::env::var_os("SHOPPING_CODEC").as_deref() == Some(std::ffi::OsStr::new("plain")) {
+            Compression::UNCOMPRESSED
+        } else {
+            Compression::SNAPPY
+        };
     let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(compression)
         .set_max_row_group_row_count(Some(row_group))
         .build();
     Ok(ArrowWriter::try_new(
@@ -195,9 +201,18 @@ pub fn write(
     let campaign_dir = output.join("campaign_daily");
     fs::create_dir_all(&user_dir)?;
     fs::create_dir_all(&campaign_dir)?;
+    let profile = std::env::var_os("BENCH_STAGES").is_some_and(|value| value == "1");
     let (users, campaigns) = rayon::join(
-        || write_users(&user_dir, partitions, catalog, workers, row_group),
-        || write_campaigns(&campaign_dir, partitions, catalog, row_group),
+        || {
+            crate::stages::Stages::span(profile, "user_parquet", || {
+                write_users(&user_dir, partitions, catalog, workers, row_group)
+            })
+        },
+        || {
+            crate::stages::Stages::span(profile, "campaign_parquet", || {
+                write_campaigns(&campaign_dir, partitions, catalog, row_group)
+            })
+        },
     );
     users?;
     campaigns

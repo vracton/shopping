@@ -410,6 +410,20 @@ impl Calendar {
     }
 
     #[inline]
+    pub fn nearby_dates(&self) -> impl Iterator<Item = (i64, usize, usize, i64)> + '_ {
+        self.days
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &epoch_day)| {
+                (epoch_day != i32::MIN).then_some((
+                    self.first_year + (index / 384) as i64,
+                    index % 384 / 32 + 1,
+                    index % 32,
+                    i64::from(epoch_day),
+                ))
+            })
+    }
+
     pub fn cutoff_days(&self, base: i64, end: i64, start: i64) -> Option<Vec<u64>> {
         let mut codes = vec![0; ((end - base) / DAY_MS + 2) as usize];
         let base_day = base.div_euclid(DAY_MS);
