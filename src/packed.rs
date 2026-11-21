@@ -1081,6 +1081,14 @@ pub fn parse_inputs(
     };
     let window_rows =
         indexed && std::env::var_os("SHOPPING_SCANNER").is_none_or(|mode| mode != "block");
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi2"
+    ))]
+    if window_rows {
+        crate::input::split_fields::observe(events);
+    }
     let decode_clicks = || {
         Stages::span(profile, "click_decode", || {
             clicks

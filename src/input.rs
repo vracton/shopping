@@ -533,7 +533,7 @@ impl Calendar {
     target_feature = "bmi2"
 ))]
 #[path = "split_fields.rs"]
-mod split_fields;
+pub(crate) mod split_fields;
 
 /// A row-oriented scanner that extracts every field boundary from two masks.
 /// Fixed-width loads are only used when the complete load is inside the shard.
