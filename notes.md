@@ -5,7 +5,7 @@
 - Build a fast, exact, single-container pipeline for the [Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). The practice leaderboard showed **0.68 s** when checked. Practice has about 20M events and allows two submissions per hour. Finals use about 60M fresh events with a 180 s cap on each run.
 - The clock includes process startup, reading input, and writing both Parquet outputs. The scorer has 8 pinned vCPUs and 24 GB RAM. Submission requires a public repository with a root `Dockerfile`. Keep generated data outside the repository.
 - The local challenge kit has three starter skeletons, 36 fixtures per starter, and the public dev answer in `dev-answer/dev-answer/`. Those downloads and generated CSVs are excluded from Git. The Rust pipeline implements both global sort and hash-partition dedup behind the same entry point and shares validation, attribution, and Parquet writing.
-- The default is hash with 2 MiB parse chunks, 64 partitions, and 16,384 Parquet rows per group. `SHOPPING_ARCH=sort` selects the baseline with 4 MiB chunks, 32 work partitions, and 65,536 rows per group.
+- The default is `packed` with 2 MiB parse chunks, 64 event dedup buckets, 64 person partitions, and 16,384 Parquet rows per group. `SHOPPING_ARCH=hash` and `SHOPPING_ARCH=sort` select the byte-slice baselines. The packed path falls back to hash if an ID, window, or category dimension needs a wider representation.
 
 ## Correctness to preserve
 
@@ -63,7 +63,7 @@ python3 scripts/bench.py run .bench/data/seed-1 --expected dev-answer/dev-answer
 python3 scripts/bench.py run /tmp/shopping-practice --cpus 8 --warmups 1 --repeats 5 -- ./target/release/shopping-sessions
 ```
 
-`check-native.sh` checks each architecture on the 36 fixtures with three settings, compares the two architectures on seeds 1–3, and compares seed 1 to the public answer. It needs the downloaded DuckDB starter files and Polars. Set `PYTHON`, `STARTER_DIR`, `DATA_ROOT`, or `PUBLIC_ANSWER` to select a different environment or dataset location.
+`check-native.sh` checks all three architectures on the 36 fixtures with three settings, compares their outputs on seeds 1–3, and compares seed 1 to the public answer. Its generated-input checks exercise buffered reads on the packed path. It needs the downloaded DuckDB starter files and Polars. Set `PYTHON`, `STARTER_DIR`, `DATA_ROOT`, or `PUBLIC_ANSWER` to select a different environment or dataset location.
 
 Set `BENCH_STAGES=1` for timings by stage. The performance settings are `SHOPPING_CHUNK_KIB`, `SHOPPING_PARTITIONS`, `SHOPPING_PARQUET_ROWS`, and `NCPU`. `sweep-native.py` warms the data and interleaves candidates in seeded order. It takes repeated `--candidate ARCH,CHUNK_KIB,PARTITIONS,PARQUET_ROWS,WORKERS` options to recheck finalists.
 
@@ -122,3 +122,26 @@ In the 6.79 s hash run, parsing and partitioning took 1.80 s, dedup and redistri
 - Prototype a fused delimiter and quote scan and a manifest-derived calendar table for timestamp conversion. Keep dialect, validity, and UTC-window checks. `ingest_ts` alone is guaranteed valid F1, so it can use a specialized decoder.
 - The 6.79 s run spent 0.98 s in setup and 0.41 s in sessions and attribution. Two later, much slower instrumented runs attributed almost all setup time to catalog construction and measured 1.18–1.99 s in post-write cleanup. The raw input scan varied from 0.37 s in the previous warmed run to 4.36 s in the audit. These runs illustrate host and cache variability. Test overlap of catalog construction with raw parsing and compare input methods after records stop borrowing mapped pages.
 - Isolated A/B probes tried the trusted F1 ingest decoder, skipping the identical-click dedup pass, and masking power-of-two partition indexes. All three passed the 36 fixtures and the public answer. None produced a repeatable end-to-end gain across seven interleaved trials on each of the three 1M seeds. Identical click copies leave the last-click winner and the union of assist intervals unchanged, so their separate dedup pass is optional for correctness.
+
+### Packed path and the 3.5 s target
+
+The packed path uses exact, order-preserving short ASCII keys and 16-byte events. It resolves links in parallel with parsing, reuses the alias map from union-find, and releases input buffers while deduplication runs. The scanner splits fields and verifies quotes with byte masks. Manifest-relative timestamps use a date table, and fixed-format ingest timestamps compare as sortable integers. Dedup uses compact hash tables with full key equality and retains invalid earliest copies. Person partitions sort integers, the aggregation loop accumulates counts and revenue while detecting gaps, and campaign-day counters use a dense table when the dimensions fit. Identical click copies need no standalone pass. Arrow preallocates output builders and campaign rows are emitted without sorting.
+
+Local 20M-event results on the 1.90 GB practice proxy with eight logical CPUs and the release binary compiled for `x86-64-v3`:
+
+| Input and CPU affinity | Measured wall times | Median |
+| --- | --- | ---: |
+| File-backed mmap, four physical cores with both siblings | 2.415, 2.445, 2.228 s | 2.415 s |
+| File-backed mmap, eight physical cores | 5.154, 2.436, 2.082 s | 2.436 s |
+| tmpfs mmap, eight physical cores | 2.710, 2.403, 2.663, 2.694 s | 2.679 s |
+
+Each file-backed series followed a warmup. The first warmup on the spread CPU mask took 10.590 s. Cache state was uncontrolled, and neither these times nor the tmpfs diagnostic represent an official scorer result. The tmpfs sweep compared 64 and 256 dedup buckets and 2 and 8 MiB chunks. The selected 64-bucket, 2 MiB combination had the most consistent times. File-backed mmap had better local results than buffering entire shards, so `SHOPPING_IO=buffered` remains opt-in. Both modes keep all intermediate records in memory. Final-scale 60M performance remains unmeasured.
+
+The local Docker image matched the 20M sort reference exactly, including all 2,240,415 user-day rows and 28,014 campaign-day rows. Docker runs pinned to eight CPUs with a 24 GB container limit on the 8 GiB WSL2 guest took 3.842–15.133 s on file-backed input. The later tmpfs Docker diagnostics were also slower than the host-process benchmark. The 3.5 s target is verified for the repeated host-process benchmark. Official scorer timing is pending. All three architectures passed the 36 fixtures under three configurations, the three 1M seeds matched across architectures, and seed 1 matched the public answer.
+
+On the representative 2.415 s run, parsing and links took 0.923 s, dedup and redistribution 0.695 s, ordering and aggregation 0.357 s, and Parquet 0.148 s. To reproduce on a scorer-compatible x86-64 host:
+
+```sh
+cargo rustc --release --locked -- -C target-cpu=x86-64-v3
+BENCH_STAGES=1 python3 scripts/bench.py run /tmp/shopping-practice --cpus 8 --warmups 1 --repeats 3 -- ./target/release/shopping-sessions
+```
