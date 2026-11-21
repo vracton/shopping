@@ -3,3 +3,9 @@
 !Cargo.lock
 !src/
 !src/**
+!generator/
+!generator/generator/
+!generator/generator/Cargo.toml
+!generator/generator/Cargo.lock
+!generator/generator/src/
+!generator/generator/src/**

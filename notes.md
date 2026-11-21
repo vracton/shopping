@@ -164,3 +164,21 @@ The fastest observed local 20M time in this sweep was 1.688 s with the previous 
 SHOPPING_ARCH=indexed SHOPPING_ROUTE=split SHOPPING_LINKS=parallel BENCH_STAGES=1 \
     python3 scripts/bench.py run /tmp/shopping-practice --cpus 8 --warmups 1 --repeats 3 -- ./target/release/shopping-sessions
 ```
+
+### Combined optimizer checkpoint against `30ae47b`
+
+The container uses compact fingerprint/location claims with full-key collision checks, sparse link union-find, a sweep of eligible sessions per campaign, and a simpler Parquet writer. `SHOPPING_ARCH=packed` still selects the packed implementation; the bare Rust binary keeps its previous default. The image trains PGO only during build on generated 1M seeds 1 and 3. The final runtime image contains no training inputs or outputs. ThinLTO and jemalloc with transparent huge pages and delayed reclamation are enabled. These settings trade memory for speed; the 20M host-process peak RSS was 3.57 GiB.
+
+Seed 2, 20M events/5M clicks, warm regular files, disk-backed Parquet in new output directories. Eleven shuffled three-way rounds after an excluded warm-up; full launch-to-exit timings, no profile logging. CPU mask 0–7, 24,000,000,000-byte memory cap and no swap. The Linux VM exposes eight vCPUs but not the scorer's physical sibling topology.
+
+| 20M implementation | Host median (best–max) | Fresh container median (best–max) |
+| --- | ---: | ---: |
+| Scored `30ae47b`, packed | 1.309 s (1.148–1.780) | 1.893 s (1.399–2.480) |
+| `e703cd3`, indexed | 1.229 s (1.078–1.507) | 1.787 s (1.185–2.306) |
+| Combined | 0.944 s (0.726–1.281) | 1.213 s (0.937–1.512) |
+
+The combined candidate beat scored packed in every paired round in both series. It crossed one second in 9/11 host runs and 2/11 containers. Docker timing uses engine start to exit, not image build, container creation or removal. On a second 20M seed (7) the container median over seven rounds was 1.127 s vs 1.640 s scored. No official submission or sub-second container-median claim.
+
+The combined path passed all 36 starter fixtures, the seed-1 public answer, 13 release unit tests, and exact differential checks on seeds 2 and 3 at 1M, seeds 2 and 7 at 20M, and seed 8 at 60M. The 60M run used the same capped container and matched all 6,652,753 user-day rows and 28,014 campaign-day rows from the scored sort implementation. Compare Parquet by schema and row multiset, not file bytes or row order.
+
+Build the repository image and run it with no `SHOPPING_*` overrides to reproduce the candidate. Override `SHOPPING_DEDUP_MODE=filter`, `SHOPPING_LINKS=parallel`, or `SHOPPING_ARCH=packed` for comparisons.

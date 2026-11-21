@@ -194,9 +194,17 @@ pub struct Person {
     categories: FxHashMap<u32, i64>,
     intervals: FxHashMap<usize, (i64, i64)>,
     bins: TimeBins,
+    assist_ends: Option<Vec<usize>>,
 }
 
 impl Person {
+    pub fn with_assist_sweep(campaigns: usize) -> Self {
+        Self {
+            assist_ends: Some(vec![0; campaigns]),
+            ..Self::default()
+        }
+    }
+
     pub fn aggregate<'a>(
         &mut self,
         user: UserId<'a>,
@@ -323,10 +331,56 @@ impl Person {
             for session in &self.sessions {
                 add_credit(session, organic, totals);
             }
+        } else if let Some(ends) = &mut self.assist_ends {
+            credit(&self.sessions, clicks, organic, totals);
+            sweep_assists(&self.sessions, clicks, ends, totals);
         } else {
             credit(&self.sessions, clicks, organic, totals);
             assist(&self.sessions, clicks, &mut self.intervals, totals);
         }
+    }
+}
+
+/// Both ends of a click's eligible session range advance monotonically.
+/// For each campaign its last end is the first potentially uncounted session.
+fn sweep_assists(
+    sessions: &[Session],
+    clicks: &[impl TimedClick],
+    assist_ends: &mut [usize],
+    totals: &mut CampaignDaily,
+) {
+    let mut begin = 0;
+    let mut end = 0;
+    let mut processed = 0;
+    for click in clicks {
+        let ts = click.timestamp();
+        while begin < sessions.len() && sessions[begin].start < ts {
+            begin += 1;
+        }
+        if begin == sessions.len() {
+            break;
+        }
+        let expiry = ts + WEEK_MS;
+        let campaign = click.campaign();
+        end = end.max(begin);
+        while end < sessions.len() && sessions[end].start <= expiry {
+            end += 1;
+        }
+        let mut index = begin.max(assist_ends[campaign]);
+        while index < end {
+            let first = index;
+            let day = sessions[index].day;
+            index += 1;
+            while index < end && sessions[index].day == day {
+                index += 1;
+            }
+            totals.at(campaign, day).assisted_sessions += (index - first) as i64;
+        }
+        assist_ends[campaign] = end;
+        processed += 1;
+    }
+    for click in &clicks[..processed] {
+        assist_ends[click.campaign()] = 0;
     }
 }
 
@@ -579,6 +633,12 @@ mod tests {
             let mut actual = CampaignDaily::default();
             credit(&sessions, &clicks, 8, &mut actual);
             assist(&sessions, &clicks, &mut FxHashMap::default(), &mut actual);
+            let mut swept = CampaignDaily::default();
+            let mut ends = [0; 9];
+            credit(&sessions, &clicks, 8, &mut swept);
+            sweep_assists(&sessions, &clicks, &mut ends, &mut swept);
+            assert_eq!(ends, [0; 9]);
+            assert_eq!(actual, swept, "round {round}");
 
             let mut expected = CampaignDaily::default();
             for session in &sessions {

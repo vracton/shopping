@@ -10,8 +10,13 @@ use crate::fast_time::FastTime;
 use crate::input::{Calendar, ChunkRows, DAY_MS, RowWindows, WEEK_MS, data_rows, decimal, fields};
 use crate::stages::Stages;
 
+#[path = "packed_links.rs"]
+mod sparse_links;
 #[path = "packed_route.rs"]
 mod split;
+
+#[path = "packed_claims.rs"]
+mod claims;
 
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
@@ -147,12 +152,14 @@ impl Links {
 enum Aliases {
     Serial(Links),
     Sharded(Vec<FxHashMap<Key, Key>>),
+    Sparse(sparse_links::Sparse),
 }
 
 impl Aliases {
     fn resolve(&self, key: Key) -> Key {
         match self {
             Self::Serial(links) => links.resolve(key),
+            Self::Sparse(links) => links.resolve(key),
             Self::Sharded(parts) => parts[bucket(key, parts.len())]
                 .get(&key)
                 .copied()
@@ -544,7 +551,7 @@ fn dedup_indexed(
         }
     }
     drop(slots);
-    route(groups.into_iter().flatten(), links, &mut output);
+    route_groups(groups, links, &mut output);
     output
 }
 
@@ -618,8 +625,31 @@ fn dedup_filtered(
         }
     }
     drop(duplicates);
-    route(groups.into_iter().flatten(), links, &mut output);
+    route_groups(groups, links, &mut output);
     output
+}
+
+fn route_groups(groups: Vec<Vec<Candidate>>, links: &Aliases, output: &mut [Vec<Event>]) {
+    if let Aliases::Sparse(table) = links {
+        let count = output.len();
+        for group in groups {
+            for block in group.chunks(24) {
+                for row in block {
+                    table.prefetch(row.user);
+                }
+                for row in block.iter().filter(|row| row.ts != INVALID) {
+                    let user = table.resolve(row.user);
+                    output[bucket(user, count)].push(Event {
+                        user,
+                        ts: row.ts,
+                        purchase: row.purchase,
+                    });
+                }
+            }
+        }
+    } else {
+        route(groups.into_iter().flatten(), links, output);
+    }
 }
 
 fn route(rows: impl Iterator<Item = Candidate>, links: &Aliases, output: &mut [Vec<Event>]) {
@@ -954,6 +984,7 @@ fn aggregate_sorted(
 }
 
 enum EventInput {
+    Claims(claims::ClaimBatch),
     ById(Vec<Vec<Vec<Candidate>>>),
     ByPerson(split::SplitEvents),
 }
@@ -1046,6 +1077,11 @@ pub fn parse_inputs(
         Stages::span(profile, "link_decode_and_union", || {
             if indexed
                 && std::env::var_os("SHOPPING_LINKS").as_deref()
+                    == Some(std::ffi::OsStr::new("sparse"))
+            {
+                sparse_links::Sparse::new(link_chunks).map(Aliases::Sparse)
+            } else if indexed
+                && std::env::var_os("SHOPPING_LINKS").as_deref()
                     == Some(std::ffi::OsStr::new("parallel"))
             {
                 Aliases::parallel(link_chunks)
@@ -1069,6 +1105,18 @@ pub fn parse_inputs(
                 rayon::join(
                     || {
                         Stages::span(profile, "event_decode_and_scatter", || {
+                            if indexed
+                                && std::env::var_os("SHOPPING_DEDUP_MODE")
+                                    .is_some_and(|m| m == "claims")
+                            {
+                                return claims::ClaimBatch::parse(
+                                    events,
+                                    dedup_count,
+                                    &parser,
+                                    window_rows,
+                                )
+                                .map(EventInput::Claims);
+                            }
                             parse(
                                 events,
                                 dedup_count,
@@ -1076,6 +1124,7 @@ pub fn parse_inputs(
                                 |row| parser.event(row),
                                 |item| item.event,
                             )
+                            .map(EventInput::ById)
                         })
                     },
                     decode_clicks,
@@ -1083,7 +1132,7 @@ pub fn parse_inputs(
             },
             decode_links,
         );
-        (EventInput::ById(events?), clicks?, links?)
+        (events?, clicks?, links?)
     };
     Some(Parsed {
         events,
@@ -1124,6 +1173,7 @@ impl Parsed {
         let (events, clicks) = rayon::join(
             || {
                 Stages::span(profile, "event_dedup_and_route", || match events {
+                    EventInput::Claims(batch) => batch.route(&links, count),
                     EventInput::ByPerson(routed) => routed.winners(count, profile),
                     EventInput::ById(groups) => {
                         let parts = groups
@@ -1140,6 +1190,18 @@ impl Parsed {
                         .into_par_iter()
                         .map(|group| {
                             let mut output = buckets(count);
+                            if let Aliases::Sparse(table) = &links {
+                                for block in group.chunks(24) {
+                                    for row in block {
+                                        table.prefetch(row.user);
+                                    }
+                                    for row in block {
+                                        let user = table.resolve(row.user);
+                                        output[bucket(user, count)].push(Click { user, ..*row });
+                                    }
+                                }
+                                return output;
+                            }
                             for mut click in group {
                                 click.user = links.resolve(click.user);
                                 output[bucket(click.user, count)].push(click);
@@ -1163,6 +1225,14 @@ impl Parsed {
                     };
                     let mut grouping = TimelineGroups::default();
                     let mut counted = CountedTimelines {
+                        scratch: if std::env::var_os("SHOPPING_ASSISTS")
+                            .is_some_and(|v| v == "sweep")
+                            && matches!(daily.campaigns, CampaignDaily::Dense { .. })
+                        {
+                            Person::with_assist_sweep(organic + 1)
+                        } else {
+                            Person::default()
+                        },
                         bin_min: std::env::var("SHOPPING_BIN_MIN")
                             .ok()
                             .and_then(|value| value.parse().ok())

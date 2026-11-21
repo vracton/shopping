@@ -7,7 +7,7 @@ use arrow_array::{Date32Array, Int64Array, RecordBatch, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use rayon::prelude::*;
 
 use crate::Result;
@@ -50,8 +50,16 @@ fn file_writer(
         };
     let properties = WriterProperties::builder()
         .set_compression(compression)
-        .set_max_row_group_row_count(Some(row_group))
-        .build();
+        .set_max_row_group_row_count(Some(row_group));
+    let properties = if std::env::var_os("SHOPPING_WRITER").is_some_and(|v| v == "simple") {
+        properties
+            .set_statistics_enabled(EnabledStatistics::None)
+            .set_offset_index_disabled(true)
+            .set_dictionary_enabled(false)
+    } else {
+        properties
+    }
+    .build();
     Ok(ArrowWriter::try_new(
         BufWriter::new(File::create(path)?),
         schema,
