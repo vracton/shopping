@@ -114,3 +114,11 @@ The finalists also ran three times each on the existing 20M-event seed-2 proxy. 
 | Hash, 65,536 | 7.02 s, 9.30 s, 6.62 s | 7.02 s | 4.38 GiB |
 
 In the 6.79 s hash run, parsing and partitioning took 1.80 s, dedup and redistribution 1.30 s, local ordering 1.74 s, and Parquet writing 0.14 s. Parsing and ordering are the first places to investigate for further speedups. The 60M final scale has yet to be measured.
+
+### Optimization audit
+
+- Prioritize compact, exact ID keys and contiguous per-person timelines. Replace repeated byte-slice comparisons with integer grouping and sort timestamps within each canonical person's range. Keep an exact representation for long or unusual IDs.
+- Narrow the records that cross the event dedup stage, reuse the partition hash when inserting into the dedup table, and measure the bytes copied by per-chunk buffers, repartitioning, and flattening. Global dedup and earliest-invalid-wins behavior are required.
+- Prototype a fused delimiter and quote scan and a manifest-derived calendar table for timestamp conversion. Keep dialect, validity, and UTC-window checks. `ingest_ts` alone is guaranteed valid F1, so it can use a specialized decoder.
+- The 6.79 s run spent 0.98 s in setup and 0.41 s in sessions and attribution. Two later, much slower instrumented runs attributed almost all setup time to catalog construction and measured 1.18–1.99 s in post-write cleanup. The raw input scan varied from 0.37 s in the previous warmed run to 4.36 s in the audit. These runs illustrate host and cache variability. Test overlap of catalog construction with raw parsing and compare input methods after records stop borrowing mapped pages.
+- Isolated A/B probes tried the trusted F1 ingest decoder, skipping the identical-click dedup pass, and masking power-of-two partition indexes. All three passed the 36 fixtures and the public answer. None produced a repeatable end-to-end gain across seven interleaved trials on each of the three 1M seeds. Identical click copies leave the last-click winner and the union of assist intervals unchanged, so their separate dedup pass is optional for correctness.
