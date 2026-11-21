@@ -197,6 +197,7 @@ pub struct Person {
     categories: FxHashMap<u32, i64>,
     intervals: FxHashMap<usize, (i64, i64)>,
     bins: TimeBins,
+    attribution: ClickBuckets,
     assist_ends: Option<Vec<usize>>,
     cells: Option<cells::Cells>,
 }
@@ -232,6 +233,59 @@ impl Person {
         cells.run(&mut self.sessions, user, plain, events, base, output);
         self.finish_campaigns(clicks, organic, &mut output.campaigns);
         true
+    }
+
+    pub fn aggregate_columns<'a, C: TimedClick, K: Ord + Copy>(
+        &mut self,
+        user: UserId<'a>,
+        plain: &[u32],
+        events: &[impl TimedEvent],
+        clicks: &mut [C],
+        id: impl Fn(&C) -> K,
+        organic: usize,
+        base: i64,
+        output: &mut Daily<'a>,
+    ) {
+        self.cells
+            .as_mut()
+            .unwrap()
+            .run(&mut self.sessions, user, plain, events, base, output);
+        let sessions = self.sessions.as_slice();
+        let totals = &mut output.campaigns;
+        if clicks.len() >= 64 && sessions.len() >= 4 && clicks.len() < u32::MAX as usize {
+            self.attribution.run(
+                sessions,
+                clicks,
+                id,
+                organic,
+                self.assist_ends.as_mut().unwrap(),
+                totals,
+            );
+        } else if clicks.len() <= 4 {
+            let ends = self.assist_ends.as_mut().unwrap();
+            for (i, session) in sessions.iter().enumerate() {
+                let mut best = None;
+                for c in clicks.iter() {
+                    let ts = c.timestamp();
+                    if !(session.start - WEEK_MS..=session.start).contains(&ts) {
+                        continue;
+                    }
+                    let key = (ts, std::cmp::Reverse(id(c)), c.campaign());
+                    best = Some(best.map_or(key, |prev| key.max(prev)));
+                    if ends[c.campaign()] != i + 1 {
+                        totals.at(c.campaign(), session.day).assisted_sessions += 1;
+                        ends[c.campaign()] = i + 1;
+                    }
+                }
+                add_credit(session, best.map_or(organic, |x| x.2), totals);
+            }
+            for c in clicks.iter() {
+                ends[c.campaign()] = 0;
+            }
+        } else {
+            clicks.sort_unstable_by_key(|c| (c.timestamp(), id(c)));
+            self.finish_campaigns(clicks, organic, totals);
+        }
     }
 
     pub fn aggregate<'a>(
@@ -366,6 +420,116 @@ impl Person {
         } else {
             credit(&self.sessions, clicks, organic, totals);
             assist(&self.sessions, clicks, &mut self.intervals, totals);
+        }
+    }
+}
+
+// Session starts are more than 30 minutes apart. Therefore a 2^20-ms
+// time cell contains at most one start. A table of the next start at a
+// cell boundary needs just one exact comparison to answer a lower bound.
+#[derive(Default)]
+struct ClickBuckets {
+    lower: Vec<u16>,
+    days: Vec<u16>,
+    heads: Vec<u32>,
+    best: Vec<usize>,
+    intervals: Vec<(u32, u16, u32)>,
+}
+
+impl ClickBuckets {
+    fn run<C: TimedClick, K: Ord + Copy>(
+        &mut self,
+        sessions: &[Session],
+        clicks: &[C],
+        id: impl Fn(&C) -> K,
+        organic: usize,
+        ends: &mut [usize],
+        totals: &mut CampaignDaily,
+    ) {
+        const SHIFT: u32 = 20;
+        const _: () = assert!((1 << SHIFT) <= SESSION_GAP_MS);
+        // Packed event offsets span at most u32::MAX milliseconds.
+        const _: () = assert!(u32::MAX as i64 / (SESSION_GAP_MS + 1) + 1 < u16::MAX as i64);
+        let n = sessions.len();
+        let first = sessions[0].start;
+        let last = sessions[n - 1].start;
+        let low = (first >> SHIFT) as usize;
+        self.lower.clear();
+        self.days.clear();
+        for (i, s) in sessions.iter().enumerate() {
+            self.lower
+                .resize(((s.start >> SHIFT) as usize) - low + 1, i as u16);
+            if i + 1 == n || sessions[i + 1].day != s.day {
+                self.days.resize(i + 1, (i + 1) as u16);
+            }
+        }
+        let at = |ts: i64| -> usize {
+            if ts <= first {
+                return 0;
+            }
+            if ts > last {
+                return n;
+            }
+            let i = self.lower[(ts >> SHIFT) as usize - low] as usize;
+            i + usize::from(sessions[i].start < ts)
+        };
+        // For credit, only the latest click whose first eligible session is
+        // this one can replace an earlier winner. For assists, all intervals
+        // with the same first session can be visited in any order.
+        self.best.clear();
+        self.best.resize(n, usize::MAX);
+        self.heads.clear();
+        self.heads.resize(n, u32::MAX);
+        self.intervals.clear();
+        for (i, c) in clicks.iter().enumerate() {
+            let ts = c.timestamp();
+            let begin = at(ts);
+            let end = at(ts + WEEK_MS + 1);
+            if begin == end {
+                continue;
+            }
+            let b = &mut self.best[begin];
+            if *b == usize::MAX
+                || ts > clicks[*b].timestamp()
+                || (ts == clicks[*b].timestamp() && id(c) < id(&clicks[*b]))
+            {
+                *b = i;
+            }
+            let next = std::mem::replace(&mut self.heads[begin], self.intervals.len() as u32);
+            self.intervals.push((c.campaign() as u32, end as u16, next));
+        }
+        let mut winner = usize::MAX;
+        for (i, s) in sessions.iter().enumerate() {
+            if self.best[i] != usize::MAX {
+                winner = self.best[i];
+            }
+            let campaign =
+                if winner != usize::MAX && s.start - clicks[winner].timestamp() <= WEEK_MS {
+                    clicks[winner].campaign()
+                } else {
+                    organic
+                };
+            add_credit(s, campaign, totals);
+            // Starts advance monotonically. Each campaign only needs its
+            // furthest credited end, including intervals from this bucket.
+            let mut link = self.heads[i];
+            while link != u32::MAX {
+                let (campaign, end, next) = self.intervals[link as usize];
+                let filled = &mut ends[campaign as usize];
+                let mut j = i.max(*filled);
+                while j < end as usize {
+                    let day_end = (self.days[j] as usize).min(end as usize);
+                    totals
+                        .at(campaign as usize, sessions[j].day)
+                        .assisted_sessions += (day_end - j) as i64;
+                    j = day_end;
+                }
+                *filled = (*filled).max(end as usize);
+                link = next;
+            }
+        }
+        for &(campaign, _, _) in &self.intervals {
+            ends[campaign as usize] = 0;
         }
     }
 }
@@ -649,6 +813,59 @@ mod tests {
             assert_eq!(compact.campaigns, sorted.campaigns, "round {round}");
             assert_eq!(summarize(&split), summarize(&sorted), "round {round}");
             assert_eq!(split.campaigns, sorted.campaigns, "round {round}");
+        }
+    }
+
+    #[test]
+    fn unordered_click_buckets_match_sorted_sweeps_at_inclusive_boundaries() {
+        let mut scratch = ClickBuckets::default();
+        let mut ends = vec![0; 9];
+        let mut state = 0xf372_94ef_u64;
+        let mut sample = |n| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 32) % n
+        };
+        for round in 0..48 {
+            let mut start = WEEK_MS * 2 + round * DAY_MS / 31;
+            let sessions: Vec<_> = (0..4 + round * 2)
+                .map(|_| {
+                    start += SESSION_GAP_MS + 1 + sample(15) as i64 * SESSION_GAP_MS;
+                    Session {
+                        start,
+                        day: day(start),
+                        revenue: sample(15) as i64,
+                    }
+                })
+                .collect();
+            let ids: Vec<_> = (0..300).map(|i| format!("c{i:03}")).collect();
+            let mut clicks: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let start = sessions[sample(sessions.len() as u64) as usize].start;
+                    let ts = match sample(6) {
+                        0 => start - WEEK_MS - 1,
+                        1 => start - WEEK_MS,
+                        2 => start - WEEK_MS + 1,
+                        3 => start,
+                        4 => start + 1,
+                        _ => start - sample(WEEK_MS as u64) as i64,
+                    };
+                    Click {
+                        ts,
+                        user: b"u",
+                        id: id.as_bytes(),
+                        campaign: sample(8) as usize,
+                    }
+                })
+                .collect();
+            let mut actual = CampaignDaily::default();
+            scratch.run(&sessions, &clicks, |c| c.id, 8, &mut ends, &mut actual);
+            assert_eq!(ends, [0; 9]);
+            clicks.sort_unstable_by_key(|c| (c.ts, c.id));
+            let mut expected = CampaignDaily::default();
+            credit(&sessions, &clicks, 8, &mut expected);
+            sweep_assists(&sessions, &clicks, &mut ends, &mut expected);
+            assert_eq!(actual, expected);
         }
     }
 

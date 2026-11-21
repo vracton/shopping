@@ -438,12 +438,12 @@ impl Part {
                     &mut counted.ordered_events[start[purchase_column]..end[purchase_column]];
                 let clicks = &mut counted.ordered_clicks[start[1]..end[1]];
                 if WIDTH == 3 {
-                    clicks.sort_unstable_by_key(|click| (click.ts, click.id));
-                    counted.scratch.try_cells(
+                    counted.scratch.aggregate_columns(
                         UserId::Packed(name),
                         &times[start[0]..end[0]],
                         events,
                         clicks,
+                        |click| click.id,
                         organic,
                         base,
                         out,
