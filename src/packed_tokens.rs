@@ -246,28 +246,51 @@ impl Directory {
 
     fn route_clicks(&self, clicks: Vec<Vec<Click>>) -> Vec<Vec<Clicks>> {
         let mask = (1 << self.shift) - 1;
+        let group_size = clicks
+            .len()
+            .div_ceil(rayon::current_num_threads() * 4)
+            .max(1);
         clicks
-            .into_par_iter()
-            .map(|rows| {
-                let mut parts: Vec<_> = (0..self.parts).map(|_| Clicks::default()).collect();
-                for block in rows.chunks(32) {
-                    for row in block {
-                        self.prefetch(row.user);
-                    }
-                    for row in block {
-                        if let Some(slot) = self.intern(row.user) {
-                            parts[slot >> self.shift].hits.push((
-                                (slot & mask) as u32,
-                                TimelineClick {
-                                    id: row.id,
-                                    ts: row.ts,
-                                    campaign: row.campaign,
-                                },
-                            ));
-                        } else {
-                            parts[bucket(row.user, self.parts)]
-                                .spill
-                                .push(Click { ..*row });
+            .par_chunks(group_size)
+            .map(|group| {
+                let len: usize = group.iter().map(Vec::len).sum();
+                let mut parts: Vec<_> = (0..self.parts)
+                    .map(|_| Clicks {
+                        hits: Vec::with_capacity(len / self.parts + len / self.parts / 4),
+                        ..Clicks::default()
+                    })
+                    .collect();
+                for rows in group {
+                    for block in rows.chunks(32) {
+                        for row in block {
+                            self.prefetch(row.user);
+                        }
+                        for row in block {
+                            if let Some(slot) = self.intern(row.user) {
+                                let part = &mut parts[slot >> self.shift];
+                                let local = (slot & mask) as u32;
+                                if local | row.campaign <= u32::from(u16::MAX) {
+                                    part.hits.push(Hit {
+                                        id: row.id,
+                                        ts: row.ts,
+                                        slot: local as u16,
+                                        campaign: row.campaign as u16,
+                                    });
+                                } else {
+                                    part.wide.push((
+                                        local,
+                                        TimelineClick {
+                                            ts: row.ts,
+                                            campaign: row.campaign,
+                                            id: row.id,
+                                        },
+                                    ));
+                                }
+                            } else {
+                                parts[bucket(row.user, self.parts)]
+                                    .spill
+                                    .push(Click { ..*row });
+                            }
                         }
                     }
                 }
@@ -307,8 +330,8 @@ impl Directory {
         }
         for group in clicks {
             for (part, clicks) in parts.iter_mut().zip(group) {
-                if !clicks.hits.is_empty() || !clicks.spill.is_empty() {
-                    part.weight += clicks.hits.len() + clicks.spill.len();
+                if clicks.len() != 0 {
+                    part.weight += clicks.len();
                     part.clicks.push(clicks);
                 }
             }
@@ -400,10 +423,26 @@ impl Events {
     }
 }
 
+// Keep the common routed click at 16 bytes. The wide side retains both indices
+// exactly when either the campaign dictionary or the local slot is larger.
+struct Hit {
+    id: Key,
+    ts: u32,
+    slot: u16,
+    campaign: u16,
+}
+
 #[derive(Default)]
 struct Clicks {
-    hits: Vec<(u32, TimelineClick)>,
+    hits: Vec<Hit>,
+    wide: Vec<(u32, TimelineClick)>,
     spill: Vec<Click>,
+}
+
+impl Clicks {
+    fn len(&self) -> usize {
+        self.hits.len() + self.wide.len() + self.spill.len()
+    }
 }
 
 #[derive(Default)]
@@ -440,7 +479,10 @@ impl Part {
             }
         }
         for group in &self.clicks {
-            for &(slot, _) in &group.hits {
+            for hit in &group.hits {
+                cursors[hit.slot as usize][1] += 1;
+            }
+            for &(slot, _) in &group.wide {
                 cursors[slot as usize][1] += 1;
             }
         }
@@ -489,7 +531,16 @@ impl Part {
         }
         let mut spill_clicks = Vec::new();
         for group in self.clicks {
-            for (slot, hit) in group.hits {
+            for hit in group.hits {
+                let position = &mut cursors[hit.slot as usize][1];
+                counted.ordered_clicks[*position] = TimelineClick {
+                    id: hit.id,
+                    ts: hit.ts,
+                    campaign: u32::from(hit.campaign),
+                };
+                *position += 1;
+            }
+            for (slot, hit) in group.wide {
                 let position = &mut cursors[slot as usize][1];
                 counted.ordered_clicks[*position] = hit;
                 *position += 1;
