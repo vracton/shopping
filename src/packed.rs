@@ -18,6 +18,9 @@ mod split;
 #[path = "packed_claims.rs"]
 mod claims;
 
+#[path = "packed_pages.rs"]
+mod pages;
+
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
 
@@ -685,7 +688,7 @@ fn flatten<T>(mut groups: Vec<Vec<T>>) -> Vec<T> {
     output
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct TimelineClick {
     ts: u32,
     campaign: u32,
@@ -701,7 +704,7 @@ impl TimedClick for TimelineClick {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct TimelineEvent(u64);
 
 impl TimedEvent for TimelineEvent {
@@ -1239,8 +1242,10 @@ impl Parsed {
                             .unwrap_or(64),
                         ..CountedTimelines::default()
                     };
+                    let mut pages = pages::Timelines::default();
                     for pair in job.buckets {
                         match mode.as_str() {
+                            "pages" => pages.run(pair, organic, base, &mut daily, &mut counted),
                             "linked" => grouping.run(pair, organic, base, &mut daily),
                             "sort" => aggregate_sorted(pair, organic, base, &mut daily),
                             _ => counted.run(pair, organic, base, &mut daily),
