@@ -503,6 +503,14 @@ impl Calendar {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+))]
+#[path = "split_fields.rs"]
+mod split_fields;
+
 /// A row-oriented scanner that extracts every field boundary from two masks.
 /// Fixed-width loads are only used when the complete load is inside the shard.
 pub struct RowWindows<'a, const N: usize> {
@@ -522,6 +530,24 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
     fn next(&mut self) -> Option<Self::Item> {
         while !self.remaining.is_empty() {
             let bytes = self.remaining;
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx2",
+                target_feature = "bmi2"
+            ))]
+            if let Some((end, fields)) = if N == 7 && bytes.len() >= 96 {
+                split_fields::event(bytes)
+            } else if N != 7 && bytes.len() >= 64 {
+                split_fields::short(bytes)
+            } else {
+                None
+            } {
+                self.remaining = &bytes[end + 1..];
+                if let Some(fields) = fields {
+                    return Some(fields);
+                }
+                continue;
+            }
             if bytes.len() >= 128 {
                 let (newline, commas, quotes) = row_masks(bytes);
                 if newline != 0 {
