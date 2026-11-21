@@ -9,10 +9,66 @@ pub(super) struct MarkedEvent {
 }
 
 pub(super) struct ClaimBatch {
-    metadata: Vec<Vec<(Key, u64)>>,
+    metadata: Vec<Witnesses>,
     events: Vec<Vec<MarkedEvent>>,
     claims: Vec<Vec<Vec<u64>>>,
     row_bits: u32,
+}
+
+/// The claim keeps the low half and this array keeps the high half of a
+/// permutation of the packed ID. Together they decide exact key equality.
+/// Most ingest codes in a decode group share their high bits.
+struct Witnesses {
+    rows: Vec<(u32, u32)>,
+    ingest_prefix: u64,
+    exceptions: Vec<u64>,
+}
+
+impl Witnesses {
+    fn new(capacity: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(capacity),
+            ingest_prefix: 0,
+            exceptions: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, residual: u32, ingest: u64) -> Option<()> {
+        const EXCEPTION: u32 = 1 << 31;
+        if self.rows.is_empty() {
+            self.ingest_prefix = ingest >> 31;
+        }
+        let low = if ingest >> 31 == self.ingest_prefix {
+            ingest as u32 & !EXCEPTION
+        } else {
+            let index = u32::try_from(self.exceptions.len()).ok()?;
+            if index >= EXCEPTION {
+                return None;
+            }
+            self.exceptions.push(ingest);
+            index | EXCEPTION
+        };
+        self.rows.push((residual, low));
+        Some(())
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> (u32, u64) {
+        let (residual, low) = self.rows[index];
+        let ingest = if low < 1 << 31 {
+            (self.ingest_prefix << 31) | u64::from(low)
+        } else {
+            self.exceptions[(low ^ (1 << 31)) as usize]
+        };
+        (residual, ingest)
+    }
+}
+
+#[inline(always)]
+fn claim_hash(key: Key) -> u64 {
+    // Multiplication by an odd constant and rotation are both bijections.
+    key.0.wrapping_mul(0xf135_7aea_2e62_a9c5).rotate_left(26)
 }
 
 impl ClaimBatch {
@@ -41,7 +97,7 @@ impl ClaimBatch {
             .enumerate()
             .map(|(i, chunks)| {
                 let bytes: usize = chunks.iter().map(|c| c.len()).sum();
-                let mut records = Vec::with_capacity(bytes / 74);
+                let mut records = Witnesses::new(bytes / 74);
                 let mut events = Vec::with_capacity(bytes / 74);
                 let mut claims: Vec<_> = (0..dedup_count)
                     .map(|_| Vec::with_capacity(bytes / 74 / dedup_count))
@@ -49,11 +105,11 @@ impl ClaimBatch {
                 let mut emit = |fields| {
                     if let Some(row) = parser.event(fields)? {
                         // Zero is the empty-slot sentinel; every packed location must be biasable by one.
-                        if records.len() >= (1_usize << row_bits) - 1 {
+                        if events.len() >= (1_usize << row_bits) - 1 {
                             return None;
                         }
-                        let h = row.event.hash();
-                        let loc = ((i as u32) << row_bits) | records.len() as u32;
+                        let h = claim_hash(row.event);
+                        let loc = ((i as u32) << row_bits) | events.len() as u32;
                         claims[((h >> 32) as usize) & (dedup_count - 1)]
                             .push((h << 32) | u64::from(loc + 1));
                         events.push(MarkedEvent {
@@ -61,7 +117,7 @@ impl ClaimBatch {
                             ts: row.ts.into(),
                             purchase: row.purchase,
                         });
-                        records.push((row.event, row.ingest));
+                        records.push((h >> 32) as u32, row.ingest)?;
                     }
                     Some(())
                 };
@@ -98,7 +154,7 @@ impl ClaimBatch {
             row_bits,
         } = self;
         let mask = (1 << row_bits) - 1;
-        let lookup = |loc: u32| metadata[(loc >> row_bits) as usize][(loc & mask) as usize];
+        let lookup = |loc: u32| metadata[(loc >> row_bits) as usize].get((loc & mask) as usize);
         let reject = |loc: u32| {
             events[(loc >> row_bits) as usize][(loc & mask) as usize]
                 .ts
@@ -203,19 +259,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn witness_codes_keep_ingest_order_across_prefixes() {
+        let mut witnesses = Witnesses::new(0);
+        let times = [1 << 31, u64::MAX, u64::MAX - 1, 0, (1 << 32) - 1];
+        for (i, &time) in times.iter().enumerate() {
+            witnesses.push(i as u32, time).unwrap();
+        }
+        for (i, &time) in times.iter().enumerate() {
+            assert_eq!(witnesses.get(i), (i as u32, time));
+        }
+    }
+
+    #[test]
     fn equal_fingerprints_do_not_merge_keys_or_rescue_an_invalid_winner() {
         let key = |s: &[u8]| Key::pack(s).unwrap();
-        let a = key(b"A");
-        let b = key(b"B");
-        let c = key(b"C");
+        let a = 1;
+        let b = 2;
+        let c = 3;
         let event = |ts: u32| MarkedEvent {
             user: key(b"user"),
             ts: ts.into(),
             purchase: 0,
         };
         // Deliberately give every claim the same fingerprint, including unrelated keys.
+        let witnesses = |rows: [(u32, u64); 3]| {
+            let mut values = Witnesses::new(rows.len());
+            for (high, ingest) in rows {
+                values.push(high, ingest).unwrap();
+            }
+            values
+        };
         let batch = ClaimBatch {
-            metadata: vec![vec![(a, 5), (b, 8), (c, 3)], vec![(a, 1), (b, 4), (c, 3)]],
+            metadata: vec![
+                witnesses([(a, 5), (b, 8), (c, 3)]),
+                witnesses([(a, 1), (b, 4), (c, 3)]),
+            ],
             events: vec![
                 vec![event(10), event(20), event(30)],
                 vec![event(INVALID), event(21), event(30)],
