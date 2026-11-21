@@ -19,6 +19,8 @@ mod split;
 mod claims;
 #[path = "packed_fused.rs"]
 mod fused;
+#[path = "packed_sketch.rs"]
+mod sketch;
 
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
@@ -986,6 +988,7 @@ fn aggregate_sorted(
 }
 
 enum EventInput {
+    Sketch(sketch::Batch),
     Fused(fused::Batch),
     Claims(claims::ClaimBatch),
     ById(Vec<Vec<Vec<Candidate>>>),
@@ -1123,6 +1126,16 @@ pub fn parse_inputs(
                 rayon::join(
                     || {
                         Stages::span(profile, "event_decode_and_scatter", || {
+                            if matches!(fused_mode.as_deref(), Some("sketch" | "tickets")) {
+                                return sketch::Batch::parse(
+                                    events,
+                                    &parser,
+                                    dedup_count,
+                                    window_rows,
+                                    fused_mode.as_deref() == Some("tickets"),
+                                )
+                                .map(EventInput::Sketch);
+                            }
                             if fused_mode.as_deref() == Some("raw") {
                                 return fused::Batch::parse(
                                     events,
@@ -1202,6 +1215,7 @@ impl Parsed {
         let (events, clicks) = rayon::join(
             || {
                 Stages::span(profile, "event_dedup_and_route", || match events {
+                    EventInput::Sketch(batch) => batch.route(&links, count),
                     EventInput::Fused(batch) => batch.finish(&links, count),
                     EventInput::Claims(batch) => batch.route(&links, count),
                     EventInput::ByPerson(routed) => routed.winners(count, profile),
