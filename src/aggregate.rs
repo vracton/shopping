@@ -5,6 +5,9 @@ use rustc_hash::FxHashMap;
 use crate::ingest::{Batches, Click, Event};
 use crate::input::{DAY_MS, WEEK_MS};
 
+#[path = "aggregate_sweep.rs"]
+mod merged;
+
 const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 #[derive(Debug, PartialEq, Eq)]
 pub enum CampaignDaily {
@@ -195,9 +198,17 @@ pub struct Person {
     intervals: FxHashMap<usize, (i64, i64)>,
     bins: TimeBins,
     assist_ends: Option<Vec<usize>>,
+    merged: Option<merged::Sweep>,
 }
 
 impl Person {
+    pub fn with_merged_sweep(campaigns: usize) -> Self {
+        Self {
+            merged: Some(merged::Sweep::new(campaigns)),
+            ..Self::default()
+        }
+    }
+
     pub fn with_assist_sweep(campaigns: usize) -> Self {
         Self {
             assist_ends: Some(vec![0; campaigns]),
@@ -327,7 +338,17 @@ impl Person {
         organic: usize,
         totals: &mut CampaignDaily,
     ) {
-        if clicks.is_empty() {
+        if let (
+            Some(sweep),
+            CampaignDaily::Dense {
+                first,
+                days,
+                values,
+            },
+        ) = (&mut self.merged, &mut *totals)
+        {
+            sweep.run(&self.sessions, clicks, organic, *first, *days, values);
+        } else if clicks.is_empty() {
             for session in &self.sessions {
                 add_credit(session, organic, totals);
             }
@@ -596,6 +617,7 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             (state >> 32) % limit
         };
+        let mut merged = merged::Sweep::new(9);
         for round in 0..120 {
             let mut sessions: Vec<_> = (0..sample(70) + 1)
                 .map(|_| {
@@ -660,6 +682,17 @@ mod tests {
                 }
             }
             assert_eq!(actual, expected, "round {round}");
+            let mut dense = vec![CampaignStats::default(); 30 * 9];
+            merged.run(&sessions, &clicks, 8, 0, 30, &mut dense);
+            for c in 0..9 {
+                for day in 0..30 {
+                    assert_eq!(
+                        &dense[c * 30 + day],
+                        expected.at(c, day as i32),
+                        "round {round}"
+                    );
+                }
+            }
         }
     }
 }

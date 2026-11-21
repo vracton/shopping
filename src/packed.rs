@@ -1228,11 +1228,12 @@ impl Parsed {
                     };
                     let mut grouping = TimelineGroups::default();
                     let mut counted = CountedTimelines {
-                        scratch: if std::env::var_os("SHOPPING_ASSISTS")
-                            .is_some_and(|v| v == "sweep")
-                            && matches!(daily.campaigns, CampaignDaily::Dense { .. })
-                        {
-                            Person::with_assist_sweep(organic + 1)
+                        scratch: if matches!(daily.campaigns, CampaignDaily::Dense { .. }) {
+                            match std::env::var("SHOPPING_ASSISTS").as_deref() {
+                                Ok("merged") => Person::with_merged_sweep(organic + 1),
+                                Ok("sweep") => Person::with_assist_sweep(organic + 1),
+                                _ => Person::default(),
+                            }
                         } else {
                             Person::default()
                         },
