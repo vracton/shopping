@@ -130,6 +130,36 @@ pub struct UserDay<'a> {
     pub top_category: Option<u32>,
 }
 
+/// The cell sessionizer writes final day counts as soon as the next day
+/// begins. Purchases update only the credited row's revenue and category.
+pub(crate) trait CellDays {
+    type User: Copy;
+    fn len(&self) -> usize;
+    fn append(&mut self, user: Self::User, day: i32, sessions: i64, events: i64);
+    fn purchase(&mut self, index: usize) -> (&mut i64, &mut Option<u32>);
+}
+
+impl<'a> CellDays for Vec<UserDay<'a>> {
+    type User = UserId<'a>;
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn append(&mut self, user: Self::User, day: i32, sessions: i64, events: i64) {
+        self.push(UserDay {
+            user,
+            day,
+            sessions,
+            events,
+            revenue: 0,
+            top_category: None,
+        });
+    }
+    fn purchase(&mut self, index: usize) -> (&mut i64, &mut Option<u32>) {
+        let row = &mut self[index];
+        (&mut row.revenue, &mut row.top_category)
+    }
+}
+
 #[derive(Default)]
 pub struct Daily<'a> {
     pub users: Vec<UserDay<'a>>,
@@ -226,11 +256,34 @@ impl Person {
         base: i64,
         output: &mut Daily<'a>,
     ) -> bool {
+        self.try_cell_days(
+            user,
+            plain,
+            events,
+            clicks,
+            organic,
+            base,
+            &mut output.users,
+            &mut output.campaigns,
+        )
+    }
+
+    pub(crate) fn try_cell_days<O: CellDays>(
+        &mut self,
+        user: O::User,
+        plain: &[u32],
+        events: &[impl TimedEvent],
+        clicks: &[impl TimedClick],
+        organic: usize,
+        base: i64,
+        days: &mut O,
+        campaigns: &mut CampaignDaily,
+    ) -> bool {
         let Some(cells) = &mut self.cells else {
             return false;
         };
-        cells.run(&mut self.sessions, user, plain, events, base, output);
-        self.finish_campaigns(clicks, organic, &mut output.campaigns);
+        cells.run(&mut self.sessions, user, plain, events, base, days);
+        self.finish_campaigns(clicks, organic, campaigns);
         true
     }
 

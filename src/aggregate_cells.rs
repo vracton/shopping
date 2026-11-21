@@ -49,14 +49,14 @@ impl Default for Cells {
 }
 
 impl Cells {
-    pub(super) fn run<'a>(
+    pub(super) fn run<O: CellDays>(
         &mut self,
         sessions: &mut Vec<Session>,
-        user: UserId<'a>,
+        user: O::User,
         plain: &[u32],
         events: &[impl TimedEvent],
         base: i64,
-        output: &mut Daily<'a>,
+        output: &mut O,
     ) {
         let mut occupied = 0u64;
         let times = plain
@@ -77,6 +77,8 @@ impl Cells {
         let mut row_indices = [0; DAYS];
         let base_day = day(base);
         let mut current_day = i32::MIN;
+        let mut day_sessions = 0i64;
+        let mut day_events = 0i64;
         let mut previous_end = -SESSION_GAP_MS - 1;
         while occupied != 0 {
             let word = occupied.trailing_zeros() as usize;
@@ -89,23 +91,30 @@ impl Cells {
                 let start = i64::from(cell.first);
                 if start - previous_end > SESSION_GAP_MS {
                     let session_day = day(base + start);
-                    if current_day != session_day {
+                    if current_day != session_day || day_sessions == 0 {
+                        if day_sessions != 0 {
+                            output.append(user, current_day, day_sessions, day_events);
+                        }
                         current_day = session_day;
-                        row_indices[(session_day - base_day) as usize] = output.users.len();
-                        output.users.push(new_user_day(user, session_day));
+                        row_indices[(session_day - base_day) as usize] = output.len();
+                        day_sessions = 0;
+                        day_events = 0;
                     }
                     sessions.push(Session {
                         start,
                         day: session_day,
                         revenue: 0,
                     });
-                    output.users.last_mut().unwrap().sessions += 1;
+                    day_sessions += 1;
                 }
-                output.users.last_mut().unwrap().events += cell.count as i64;
+                day_events += cell.count as i64;
                 previous_end = i64::from(cell.last);
                 *cell = Cell::EMPTY;
                 self.owners[index] = sessions.len() - 1;
             }
+        }
+        if day_sessions != 0 {
+            output.append(user, current_day, day_sessions, day_events);
         }
         for event in events {
             let (price, category) = event.purchase();
@@ -116,20 +125,20 @@ impl Cells {
             let index = ((event.timestamp() as u32) >> SHIFT) as usize;
             let session = &mut sessions[self.owners[index]];
             let offset = (session.day - base_day) as usize;
-            let row = &mut output.users[row_indices[offset]];
+            let (revenue, top_category) = output.purchase(row_indices[offset]);
             let price = i64::from(price);
-            row.revenue += price;
+            *revenue += price;
             session.revenue += price;
             let amounts = &mut self.by_category[offset * CATEGORIES..][..CATEGORIES];
             if amounts[category] == 0 {
                 self.touched_categories.push(offset * CATEGORIES + category);
             }
             amounts[category] += price;
-            if row.top_category.is_none_or(|prev| {
+            if top_category.is_none_or(|prev| {
                 (amounts[category], std::cmp::Reverse(category))
                     > (amounts[prev as usize], std::cmp::Reverse(prev as usize))
             }) {
-                row.top_category = Some(category as u32);
+                *top_category = Some(category as u32);
             }
         }
         for index in self.touched_categories.drain(..) {
@@ -164,7 +173,7 @@ mod tests {
                 &plain,
                 &purchases,
                 0,
-                &mut output,
+                &mut output.users,
             );
             assert_eq!(
                 sessions

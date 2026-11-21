@@ -16,7 +16,7 @@ use crate::catalog::Catalog;
 
 #[path = "output_pages.rs"]
 mod pages;
-pub(crate) use pages::BucketOutput;
+pub(crate) use pages::{BucketOutput, PartWriter};
 
 fn user_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -56,7 +56,7 @@ fn file_writer(
         .set_compression(compression)
         .set_max_row_group_row_count(Some(row_group));
     let mode = std::env::var("SHOPPING_WRITER").unwrap_or_default();
-    let properties = if matches!(mode.as_str(), "simple" | "pages" | "bucket") {
+    let properties = if matches!(mode.as_str(), "simple" | "pages" | "bucket" | "typed") {
         properties
             .set_statistics_enabled(EnabledStatistics::None)
             .set_offset_index_disabled(true)
@@ -118,7 +118,8 @@ fn write_user_part(
     catalog: &Catalog<'_>,
     row_group: usize,
 ) -> Result<()> {
-    if std::env::var_os("SHOPPING_WRITER").is_some_and(|mode| mode == "pages" || mode == "bucket")
+    if std::env::var_os("SHOPPING_WRITER")
+        .is_some_and(|mode| mode == "pages" || mode == "bucket" || mode == "typed")
         && pages::try_write(path, partitions, catalog, row_group)?
     {
         return Ok(());

@@ -17,8 +17,9 @@ use parquet::file::writer::{SerializedPageWriter, TrackedWrite};
 use parquet::schema::types::{ColumnDescPtr, SchemaDescPtr};
 
 use crate::Result;
-use crate::aggregate::{Daily, UserDay, UserId};
+use crate::aggregate::{CellDays, Daily, UserDay, UserId};
 use crate::catalog::Catalog;
+use crate::packed::Key;
 
 fn varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 128 {
@@ -133,21 +134,23 @@ fn integers<const INT32: bool>(
     get: impl Fn(&UserDay<'_>) -> i64,
 ) -> DataPage {
     let values: Vec<_> = rows.iter().map(get).collect();
-    let mut out = Vec::with_capacity(rows.len() * 2);
-    write_deltas::<INT32>(&mut out, &values);
+    delta_page::<INT32>(&values)
+}
+
+fn delta_page<const INT32: bool>(values: &[i64]) -> DataPage {
+    let mut out = Vec::with_capacity(values.len() * 2);
+    write_deltas::<INT32>(&mut out, values);
     DataPage::required(out, Encoding::DELTA_BINARY_PACKED)
 }
 
-fn identifiers(rows: &[UserDay<'_>]) -> DataPage {
+fn identifiers<T>(rows: &[T], key: impl Fn(&T) -> Key) -> DataPage {
     let mut previous = None;
     let mut previous_len = 0;
     let mut prefixes = Vec::with_capacity(rows.len());
     let mut lengths = Vec::with_capacity(rows.len());
     let mut suffix = Vec::with_capacity(rows.len() * 4);
     for row in rows {
-        let UserId::Packed(key) = row.user else {
-            unreachable!()
-        };
+        let key = key(row);
         if previous == Some(key) {
             prefixes.push(previous_len);
             lengths.push(0);
@@ -168,20 +171,24 @@ fn identifiers(rows: &[UserDay<'_>]) -> DataPage {
     DataPage::required(out, Encoding::DELTA_BYTE_ARRAY)
 }
 
-fn categories(rows: &[UserDay<'_>], catalog: &Catalog<'_>) -> Result<DataPage> {
+fn categories<T>(
+    rows: &[T],
+    get: impl Fn(&T) -> Option<u32>,
+    catalog: &Catalog<'_>,
+) -> Result<DataPage> {
     let mut out = Vec::with_capacity(rows.len() * 2);
     // One literal run of definition bits; unused bits in the last byte are zero.
     varint(&mut out, (rows.len().div_ceil(8) * 2 + 1) as u64);
     let mut defined = 0;
     for group in rows.chunks(8) {
         let bits = group.iter().enumerate().fold(0u8, |mask, (i, row)| {
-            mask | ((row.top_category.is_some() as u8) << i)
+            mask | ((get(row).is_some() as u8) << i)
         });
         out.push(bits);
         defined += bits.count_ones() as usize;
     }
     let levels_len = out.len();
-    for index in rows.iter().filter_map(|r| r.top_category) {
+    for index in rows.iter().filter_map(get) {
         let text = std::str::from_utf8(catalog.categories[index as usize])?.as_bytes();
         out.extend_from_slice(&(text.len() as u32).to_le_bytes());
         out.extend_from_slice(text);
@@ -211,6 +218,7 @@ pub(crate) struct BucketOutput<'a> {
     path: PathBuf,
     catalog: &'a Catalog<'a>,
     rows: usize,
+    pub(crate) typed: bool,
 }
 
 impl<'a> BucketOutput<'a> {
@@ -219,9 +227,11 @@ impl<'a> BucketOutput<'a> {
         catalog: &'a Catalog<'a>,
         requested: usize,
     ) -> Result<Option<Self>> {
-        if !std::env::var_os("SHOPPING_WRITER").is_some_and(|s| s == "bucket") {
-            return Ok(None);
-        }
+        let typed = match std::env::var("SHOPPING_WRITER").as_deref() {
+            Ok("typed") => true,
+            Ok("bucket") => false,
+            _ => return Ok(None),
+        };
         let Some(rows) = row_group_size(catalog, requested) else {
             return Ok(None);
         };
@@ -231,11 +241,37 @@ impl<'a> BucketOutput<'a> {
             path,
             catalog,
             rows,
+            typed,
         }))
     }
 
     pub(crate) fn open(&self, index: usize) -> Result<PartWriter> {
         PartWriter::open(&self.path.join(format!("part-{index}.parquet")))
+    }
+
+    // Purchases may refer to any day of the current shopper. Flush at a
+    // shopper boundary so those updates are complete before encoding a page.
+    pub(crate) fn flush_columns(&self, part: &mut PartWriter, finish: bool) -> Result<()> {
+        let len = part.columns.len();
+        if len == 0 || (!finish && len < self.rows) {
+            return Ok(());
+        }
+        let mut columns = std::mem::take(&mut part.columns);
+        for start in (0..len).step_by(self.rows) {
+            let r = start..(start + self.rows).min(len);
+            let pages = [
+                identifiers(&columns.keys[r.clone()], |&k| k),
+                delta_page::<true>(&columns.days[r.clone()]),
+                delta_page::<false>(&columns.sessions[r.clone()]),
+                delta_page::<false>(&columns.events[r.clone()]),
+                delta_page::<false>(&columns.revenue[r.clone()]),
+                categories(&columns.categories[r.clone()], |&v| v, self.catalog)?,
+            ];
+            part.append_pages(r.len(), pages)?;
+        }
+        columns.clear();
+        part.columns = columns;
+        Ok(())
     }
 
     pub(crate) fn append(&self, part: &mut PartWriter, rows: &[UserDay<'_>]) -> Result<()> {
@@ -270,7 +306,50 @@ pub(super) fn try_write(
     Ok(true)
 }
 
+#[derive(Default)]
+pub(crate) struct UserColumns {
+    keys: Vec<Key>,
+    days: Vec<i64>,
+    sessions: Vec<i64>,
+    events: Vec<i64>,
+    revenue: Vec<i64>,
+    categories: Vec<Option<u32>>,
+}
+
+impl UserColumns {
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.days.clear();
+        self.sessions.clear();
+        self.events.clear();
+        self.revenue.clear();
+        self.categories.clear();
+    }
+}
+
+impl CellDays for UserColumns {
+    type User = Key;
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn append(&mut self, user: Key, day: i32, sessions: i64, events: i64) {
+        self.keys.push(user);
+        self.days.push(i64::from(day));
+        self.sessions.push(sessions);
+        self.events.push(events);
+        self.revenue.push(0);
+        self.categories.push(None);
+    }
+
+    fn purchase(&mut self, index: usize) -> (&mut i64, &mut Option<u32>) {
+        (&mut self.revenue[index], &mut self.categories[index])
+    }
+}
+
 pub(crate) struct PartWriter {
+    pub(crate) columns: UserColumns,
     dst: TrackedWrite<File>,
     schema: SchemaDescPtr,
     groups: Vec<RowGroupMetaData>,
@@ -284,6 +363,7 @@ impl PartWriter {
         dst.write_all(b"PAR1")?;
         Ok(Self {
             dst,
+            columns: UserColumns::default(),
             schema,
             groups: Vec::new(),
             num_rows: 0,
@@ -292,20 +372,23 @@ impl PartWriter {
 
     fn append(&mut self, rows: &[UserDay<'_>], catalog: &Catalog<'_>) -> Result<()> {
         let pages = [
-            identifiers(rows),
+            identifiers(rows, |r| match r.user {
+                UserId::Packed(key) => key,
+                _ => unreachable!(),
+            }),
             integers::<true>(rows, |r| i64::from(r.day)),
             integers::<false>(rows, |r| r.sessions),
             integers::<false>(rows, |r| r.events),
             integers::<false>(rows, |r| r.revenue),
-            categories(rows, catalog)?,
+            categories(rows, |r| r.top_category, catalog)?,
         ];
+        self.append_pages(rows.len(), pages)
+    }
+
+    fn append_pages(&mut self, rows: usize, pages: [DataPage; 6]) -> Result<()> {
         let mut columns = Vec::with_capacity(pages.len());
         for (index, page) in pages.into_iter().enumerate() {
-            columns.push(page.write(
-                &mut self.dst,
-                self.schema.column(index),
-                rows.len() as u32,
-            )?);
+            columns.push(page.write(&mut self.dst, self.schema.column(index), rows as u32)?);
         }
         let bytes = columns
             .iter()
@@ -314,11 +397,11 @@ impl PartWriter {
         self.groups.push(
             RowGroupMetaData::builder(Arc::clone(&self.schema))
                 .set_column_metadata(columns)
-                .set_num_rows(rows.len() as i64)
+                .set_num_rows(rows as i64)
                 .set_total_byte_size(bytes)
                 .build()?,
         );
-        self.num_rows += rows.len() as i64;
+        self.num_rows += rows as i64;
         Ok(())
     }
 

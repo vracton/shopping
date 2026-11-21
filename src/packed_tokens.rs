@@ -384,7 +384,8 @@ impl Directory {
                             organic,
                             base,
                             &mut daily,
-                        );
+                            output.filter(|out| out.typed).zip(writer.as_mut()),
+                        )?;
                     } else {
                         part.finish::<2>(
                             keys,
@@ -394,14 +395,16 @@ impl Directory {
                             organic,
                             base,
                             &mut daily,
-                        );
+                            None,
+                        )?;
                     }
                     if let (Some(out), Some(writer)) = (output, &mut writer) {
                         out.append(writer, &daily.users)?;
                         daily.users.clear();
                     }
                 }
-                if let Some(writer) = writer {
+                if let (Some(out), Some(mut writer)) = (output, writer) {
+                    out.flush_columns(&mut writer, true)?;
                     writer.close()?;
                 }
                 Ok(daily)
@@ -466,7 +469,8 @@ impl Part {
         organic: usize,
         base: i64,
         out: &mut Daily<'static>,
-    ) {
+        mut direct: Option<(&crate::output::BucketOutput, &mut crate::output::PartWriter)>,
+    ) -> crate::Result<()> {
         cursors.clear();
         cursors.resize(keys.len(), [0; WIDTH]);
         let purchase_column = if WIDTH == 3 { 2 } else { 0 };
@@ -558,15 +562,29 @@ impl Part {
                 let clicks = &mut counted.ordered_clicks[start[1]..end[1]];
                 if WIDTH == 3 {
                     clicks.sort_unstable_by_key(|click| (click.ts, click.id));
-                    counted.scratch.try_cells(
-                        UserId::Packed(name),
-                        &times[start[0]..end[0]],
-                        events,
-                        clicks,
-                        organic,
-                        base,
-                        out,
-                    );
+                    if let Some((output, writer)) = direct.as_mut() {
+                        counted.scratch.try_cell_days(
+                            name,
+                            &times[start[0]..end[0]],
+                            events,
+                            clicks,
+                            organic,
+                            base,
+                            &mut writer.columns,
+                            &mut out.campaigns,
+                        );
+                        output.flush_columns(writer, false)?;
+                    } else {
+                        counted.scratch.try_cells(
+                            UserId::Packed(name),
+                            &times[start[0]..end[0]],
+                            events,
+                            clicks,
+                            organic,
+                            base,
+                            out,
+                        );
+                    }
                 } else {
                     finish_timeline(
                         &mut counted.scratch,
@@ -585,6 +603,7 @@ impl Part {
         if !spill_events.is_empty() {
             counted.run((spill_events, spill_clicks), organic, base, out);
         }
+        Ok(())
     }
 }
 
