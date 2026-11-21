@@ -39,14 +39,18 @@ impl Cells {
         &mut self,
         sessions: &mut Vec<Session>,
         user: UserId<'a>,
+        plain: &[u32],
         events: &[impl TimedEvent],
         base: i64,
         output: &mut Daily<'a>,
     ) {
         let mut occupied = 0u64;
         self.purchases.clear();
-        for event in events {
-            let ts = event.timestamp() as u32;
+        let times = plain.iter().map(|&ts| (ts, (0, 0)));
+        let other = events
+            .iter()
+            .map(|event| (event.timestamp() as u32, event.purchase()));
+        for (ts, (price, category)) in times.chain(other) {
             let index = ts as usize / BIN_MS;
             let cell = &mut self.slots[index];
             if cell.count == 0 {
@@ -59,7 +63,6 @@ impl Cells {
                 cell.last = cell.last.max(ts);
             }
             cell.count += 1;
-            let (price, category) = event.purchase();
             if price != 0 {
                 self.purchases.push((index, category as usize, price));
             }

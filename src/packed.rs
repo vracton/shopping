@@ -977,7 +977,15 @@ fn finish_timeline(
     out: &mut Daily<'static>,
 ) {
     clicks.sort_unstable_by_key(|click| (click.ts, click.id));
-    if scratch.try_cells(UserId::Packed(name), events, clicks, organic, base, out) {
+    if scratch.try_cells(
+        UserId::Packed(name),
+        &[],
+        events,
+        clicks,
+        organic,
+        base,
+        out,
+    ) {
         return;
     }
     if bin_min > 0 && events.len() >= bin_min {

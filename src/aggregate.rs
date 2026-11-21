@@ -206,15 +206,20 @@ impl Person {
         Self {
             assist_ends: Some(vec![0; campaigns]),
             cells: std::env::var_os("SHOPPING_SESSIONIZER")
-                .is_some_and(|s| s == "cells")
+                .is_some_and(|s| s == "cells" || s == "columns")
                 .then(cells::Cells::default),
             ..Self::default()
         }
     }
 
+    pub fn has_cells(&self) -> bool {
+        self.cells.is_some()
+    }
+
     pub fn try_cells<'a>(
         &mut self,
         user: UserId<'a>,
+        plain: &[u32],
         events: &[impl TimedEvent],
         clicks: &[impl TimedClick],
         organic: usize,
@@ -224,7 +229,7 @@ impl Person {
         let Some(cells) = &mut self.cells else {
             return false;
         };
-        cells.run(&mut self.sessions, user, events, base, output);
+        cells.run(&mut self.sessions, user, plain, events, base, output);
         self.finish_campaigns(clicks, organic, &mut output.campaigns);
         true
     }
@@ -597,7 +602,31 @@ mod tests {
                 &mut unordered,
             );
             let mut compact = Daily::default();
-            assert!(third.try_cells(UserId::Bytes(b"u"), &events, &clicks, 5, base, &mut compact));
+            assert!(third.try_cells(
+                UserId::Bytes(b"u"),
+                &[],
+                &events,
+                &clicks,
+                5,
+                base,
+                &mut compact
+            ));
+            let mut split = Daily::default();
+            let plain: Vec<_> = events
+                .iter()
+                .filter(|e| e.price == 0)
+                .map(|e| e.ts as u32)
+                .collect();
+            let purchases: Vec<_> = events.iter().filter(|e| e.price != 0).copied().collect();
+            assert!(third.try_cells(
+                UserId::Bytes(b"u"),
+                &plain,
+                &purchases,
+                &clicks,
+                5,
+                base,
+                &mut split
+            ));
             events.sort_unstable_by_key(|event| event.ts);
             second.aggregate(UserId::Bytes(b"u"), &events, &clicks, 5, base, &mut sorted);
             let summarize = |out: &Daily| {
@@ -618,6 +647,8 @@ mod tests {
             assert_eq!(unordered.campaigns, sorted.campaigns, "round {round}");
             assert_eq!(summarize(&compact), summarize(&sorted), "round {round}");
             assert_eq!(compact.campaigns, sorted.campaigns, "round {round}");
+            assert_eq!(summarize(&split), summarize(&sorted), "round {round}");
+            assert_eq!(split.campaigns, sorted.campaigns, "round {round}");
         }
     }
 

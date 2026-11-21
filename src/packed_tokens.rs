@@ -283,11 +283,35 @@ impl Directory {
                         .unwrap_or(64),
                     ..CountedTimelines::default()
                 };
+                let columns = counted.scratch.has_cells()
+                    && std::env::var_os("SHOPPING_SESSIONIZER").is_some_and(|s| s == "columns");
                 let mut cursors = Vec::new();
+                let mut column_cursors = Vec::new();
+                let mut times = Vec::new();
                 for part in job.buckets {
                     let span = 1 << self.shift;
                     let keys = &self.keys[part.index * span..(part.index + 1) * span];
-                    part.finish(keys, &mut cursors, &mut counted, organic, base, &mut daily);
+                    if columns {
+                        part.finish::<3>(
+                            keys,
+                            &mut column_cursors,
+                            &mut times,
+                            &mut counted,
+                            organic,
+                            base,
+                            &mut daily,
+                        );
+                    } else {
+                        part.finish::<2>(
+                            keys,
+                            &mut cursors,
+                            &mut times,
+                            &mut counted,
+                            organic,
+                            base,
+                            &mut daily,
+                        );
+                    }
                 }
                 daily
             })
@@ -323,40 +347,51 @@ struct Part {
 }
 
 impl Part {
-    fn finish(
+    // Width two stores events/clicks. In the columnar sessionizer width three
+    // stores plain timestamps/clicks/purchases; the ordinary event payload
+    // never has to expand back to eight bytes.
+    fn finish<const WIDTH: usize>(
         self,
         keys: &[AtomicU64],
-        cursors: &mut Vec<(usize, usize)>,
+        cursors: &mut Vec<[usize; WIDTH]>,
+        times: &mut Vec<u32>,
         counted: &mut CountedTimelines,
         organic: usize,
         base: i64,
         out: &mut Daily<'static>,
     ) {
         cursors.clear();
-        cursors.resize(keys.len(), (0, 0));
+        cursors.resize(keys.len(), [0; WIDTH]);
+        let purchase_column = if WIDTH == 3 { 2 } else { 0 };
         for group in &self.events {
             for &[slot, _] in &group.plain {
-                cursors[slot as usize].0 += 1;
+                cursors[slot as usize][0] += 1;
             }
             for &[slot, _, _] in &group.purchases {
-                cursors[slot as usize].0 += 1;
+                cursors[slot as usize][purchase_column] += 1;
             }
         }
         for group in &self.clicks {
             for &(slot, _) in &group.hits {
-                cursors[slot as usize].1 += 1;
+                cursors[slot as usize][1] += 1;
             }
         }
-        let (mut events, mut clicks) = (0, 0);
+        let mut totals = [0; WIDTH];
         for cursor in &mut *cursors {
-            let (ne, nc) = *cursor;
-            *cursor = (events, clicks);
-            events += ne;
-            clicks += nc;
+            let counts = *cursor;
+            *cursor = totals;
+            for column in 0..WIDTH {
+                totals[column] += counts[column];
+            }
         }
-        counted.ordered_events.resize(events, TimelineEvent(0));
+        if WIDTH == 3 {
+            times.resize(totals[0], 0);
+        }
+        counted
+            .ordered_events
+            .resize(totals[purchase_column], TimelineEvent(0));
         counted.ordered_clicks.resize(
-            clicks,
+            totals[1],
             TimelineClick {
                 ts: 0,
                 campaign: 0,
@@ -366,12 +401,16 @@ impl Part {
         let mut spill_events = Vec::new();
         for group in self.events {
             for [slot, ts] in group.plain {
-                let position = &mut cursors[slot as usize].0;
-                counted.ordered_events[*position] = TimelineEvent(u64::from(ts) << 32);
+                let position = &mut cursors[slot as usize][0];
+                if WIDTH == 3 {
+                    times[*position] = ts;
+                } else {
+                    counted.ordered_events[*position] = TimelineEvent(u64::from(ts) << 32);
+                }
                 *position += 1;
             }
             for [slot, ts, purchase] in group.purchases {
-                let position = &mut cursors[slot as usize].0;
+                let position = &mut cursors[slot as usize][purchase_column];
                 counted.ordered_events[*position] =
                     TimelineEvent(u64::from(ts) << 32 | u64::from(purchase));
                 *position += 1;
@@ -383,7 +422,7 @@ impl Part {
         let mut spill_clicks = Vec::new();
         for group in self.clicks {
             for (slot, hit) in group.hits {
-                let position = &mut cursors[slot as usize].1;
+                let position = &mut cursors[slot as usize][1];
                 counted.ordered_clicks[*position] = hit;
                 *position += 1;
             }
@@ -391,21 +430,38 @@ impl Part {
                 spill_clicks.push(group.spill)
             }
         }
-        let (mut e, mut c) = (0, 0);
-        for (slot, &(end_e, end_c)) in cursors.iter().enumerate() {
-            if end_e != e {
-                finish_timeline(
-                    &mut counted.scratch,
-                    counted.bin_min,
-                    Key(keys[slot].load(Relaxed)),
-                    &mut counted.ordered_events[e..end_e],
-                    &mut counted.ordered_clicks[c..end_c],
-                    organic,
-                    base,
-                    out,
-                );
+        let mut start = [0; WIDTH];
+        for (slot, &end) in cursors.iter().enumerate() {
+            if end[0] != start[0] || end[purchase_column] != start[purchase_column] {
+                let name = Key(keys[slot].load(Relaxed));
+                let events =
+                    &mut counted.ordered_events[start[purchase_column]..end[purchase_column]];
+                let clicks = &mut counted.ordered_clicks[start[1]..end[1]];
+                if WIDTH == 3 {
+                    clicks.sort_unstable_by_key(|click| (click.ts, click.id));
+                    counted.scratch.try_cells(
+                        UserId::Packed(name),
+                        &times[start[0]..end[0]],
+                        events,
+                        clicks,
+                        organic,
+                        base,
+                        out,
+                    );
+                } else {
+                    finish_timeline(
+                        &mut counted.scratch,
+                        counted.bin_min,
+                        name,
+                        events,
+                        clicks,
+                        organic,
+                        base,
+                        out,
+                    );
+                }
             }
-            (e, c) = (end_e, end_c);
+            start = end;
         }
         if !spill_events.is_empty() {
             counted.run((spill_events, spill_clicks), organic, base, out);
