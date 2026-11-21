@@ -336,11 +336,12 @@ impl Parser<'_, '_> {
             return Some(None);
         }
         let event = Key::pack(id)?;
-        let Some((ingest, event_time)) = (if let Some(fast) = &self.fast_time {
-            fast.event_times(ts, ingest, &self.calendar)
+        let code = if self.fast_time.is_some() {
+            FastTime::ingest(ingest)
         } else {
-            Calendar::ingest_code(ingest).map(|c| (c, self.calendar.timestamp(ts)))
-        }) else {
+            Calendar::ingest_code(ingest)
+        };
+        let Some(ingest) = code else {
             return Some(None);
         };
         let mut candidate = Candidate {
@@ -352,7 +353,10 @@ impl Parser<'_, '_> {
         if user.is_empty() || product.is_empty() {
             return Some(Some(candidate));
         }
-        let Some(ts) = event_time.filter(|&t| self.start <= t && t < self.end) else {
+        let Some(ts) = self
+            .timestamp(ts)
+            .filter(|&t| self.start <= t && t < self.end)
+        else {
             return Some(Some(candidate));
         };
         let relative = (ts - self.base) as u32;

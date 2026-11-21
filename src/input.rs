@@ -535,12 +535,10 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
                 target_feature = "avx2",
                 target_feature = "bmi2"
             ))]
-            if let Some((end, fields)) = if N == 7 && bytes.len() >= 96 {
+            if let Some((end, fields)) = if N == 7 {
                 split_fields::event(bytes)
-            } else if N != 7 && bytes.len() >= 64 {
-                split_fields::short(bytes)
             } else {
-                None
+                split_fields::short(bytes)
             } {
                 self.remaining = &bytes[end + 1..];
                 if let Some(fields) = fields {
