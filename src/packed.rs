@@ -861,6 +861,7 @@ impl TimelineGroups {
 /// ranges. A range is sorted independently, with no partition-wide key sort.
 #[derive(Default)]
 struct CountedTimelines {
+    slot_offsets: Vec<u64>,
     ordinals: FxHashMap<Key, usize>,
     names: Vec<Key>,
     locations: Vec<usize>,

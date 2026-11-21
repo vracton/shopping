@@ -208,6 +208,14 @@ pub(super) fn group(
     base: i64,
     out: &mut Daily<'static>,
 ) {
+    let event_rows = events.iter().map(Vec::len).sum::<usize>();
+    let click_rows = clicks.iter().map(Vec::len).sum::<usize>();
+    if std::env::var_os("SHOPPING_SLOT_COUNTS").is_some_and(|v| v == "packed")
+        && u32::try_from(event_rows).is_ok()
+        && u32::try_from(click_rows).is_ok()
+    {
+        return group_packed(dir, count, timelines, (events, clicks), organic, base, out);
+    }
     let shift = count.trailing_zeros();
     let width = dir.slots.len().div_ceil(count);
     let ordinal = |key: Key| ((key.0 & !TOKEN) >> shift) as usize;
@@ -284,6 +292,114 @@ pub(super) fn group(
         let clicks = &mut t.ordered_clicks[last - t.click_counts[at]..last];
         clicks.sort_unstable_by_key(|click| (click.ts, click.id));
         let user = UserId::Packed(dir.name(t.names[at]));
+        if t.bin_min > 0 && events.len() >= t.bin_min {
+            t.scratch
+                .aggregate_binned(user, events, clicks, organic, base, out);
+        } else {
+            events.sort_unstable_by_key(|event| event.0);
+            t.scratch
+                .aggregate(user, events, clicks, organic, base, out);
+        }
+    }
+}
+
+/// When both totals fit in 32 bits, a cumulative 64-bit sum gives both
+/// range ends without cross-field carries. Reverse scatter turns those
+/// same ends into starts, so there is one mutable word per ordinal.
+fn group_packed(
+    dir: &Directory,
+    count: usize,
+    t: &mut CountedTimelines,
+    (events, clicks): BucketPair,
+    organic: usize,
+    base: i64,
+    out: &mut Daily<'static>,
+) {
+    const CLICK_UNIT: u64 = 1 << 32;
+    let Some(first) = events.iter().find_map(|part| part.first()) else {
+        return;
+    };
+    let partition = dir.partition(first.user, count) as u64;
+    let shift = count.trailing_zeros();
+    let width = dir.slots.len().div_ceil(count);
+    let ordinal = |key: Key| ((key.0 & !TOKEN) >> shift) as usize;
+    t.slot_offsets.clear();
+    t.slot_offsets.resize(width, 0);
+    t.ordinals.clear();
+    t.names.clear();
+    for row in events.iter().flatten() {
+        let key = row.user;
+        let at = if key.0 & TOKEN != 0 {
+            ordinal(key)
+        } else {
+            *t.ordinals.entry(key).or_insert_with(|| {
+                let at = t.slot_offsets.len();
+                t.slot_offsets.push(0);
+                t.names.push(key);
+                at
+            })
+        };
+        t.slot_offsets[at] += 1;
+    }
+    let position = |key: Key| {
+        if key.0 & TOKEN != 0 {
+            Some(ordinal(key))
+        } else {
+            t.ordinals.get(&key).copied()
+        }
+    };
+    for row in clicks.iter().flatten() {
+        if let Some(at) = position(row.user) {
+            t.slot_offsets[at] += CLICK_UNIT;
+        }
+    }
+    let mut total = 0_u64;
+    for end in &mut t.slot_offsets {
+        total += *end;
+        *end = total;
+    }
+    t.slot_offsets.push(total);
+    t.ordered_events
+        .resize(total as u32 as usize, TimelineEvent(0));
+    t.ordered_clicks.resize(
+        (total >> 32) as usize,
+        TimelineClick {
+            ts: 0,
+            campaign: 0,
+            id: Key(0),
+        },
+    );
+    for row in events.into_iter().flatten() {
+        let next = &mut t.slot_offsets[position(row.user).unwrap()];
+        *next -= 1;
+        t.ordered_events[*next as u32 as usize] =
+            TimelineEvent((u64::from(row.ts) << 32) | u64::from(row.purchase));
+    }
+    for row in clicks.into_iter().flatten() {
+        if let Some(at) = position(row.user) {
+            let next = &mut t.slot_offsets[at];
+            *next -= CLICK_UNIT;
+            t.ordered_clicks[(*next >> 32) as usize] = TimelineClick {
+                ts: row.ts,
+                campaign: row.campaign,
+                id: row.id,
+            };
+        }
+    }
+    for (at, bounds) in t.slot_offsets.windows(2).enumerate() {
+        let (start, end) = (bounds[0] as u32 as usize, bounds[1] as u32 as usize);
+        if start == end {
+            continue;
+        }
+        let events = &mut t.ordered_events[start..end];
+        let clicks = &mut t.ordered_clicks[(bounds[0] >> 32) as usize..(bounds[1] >> 32) as usize];
+        clicks.sort_unstable_by_key(|click| (click.ts, click.id));
+        let name = if at < width {
+            dir.name(Key(TOKEN | ((at as u64) << shift) | partition))
+        } else {
+            t.names[at - width]
+        };
+        let user = UserId::Packed(name);
         if t.bin_min > 0 && events.len() >= t.bin_min {
             t.scratch
                 .aggregate_binned(user, events, clicks, organic, base, out);
