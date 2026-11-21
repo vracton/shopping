@@ -2,6 +2,32 @@
 //! Only potential duplicates read the full ID and ingest timestamp.
 use super::*;
 
+/// Bits 0..32 record first sightings, bits 32..64 repeated sightings.
+/// Singleton positions never need an exact slot. A repeated position can
+/// contain arbitrarily many distinct full keys, so size the exact table by
+/// subtracting the *number of singleton rows*, not by counting repeated bits.
+fn repeated_positions(groups: &[Vec<u64>], rows: usize) -> (Vec<u32>, usize) {
+    let words = rows.div_ceil(2).next_power_of_two();
+    let mut counts = vec![0u64; words];
+    for &entry in groups.iter().flatten() {
+        let h = (entry >> 32) as usize;
+        let index = (h >> 5) & (words - 1);
+        let bit = 1u64 << (h & 31);
+        let old = counts[index];
+        counts[index] = old | bit | ((old & bit) << 32);
+    }
+    let mut ambiguous = rows;
+    let repeated = counts
+        .into_iter()
+        .map(|pair| {
+            let duplicate = (pair >> 32) as u32;
+            ambiguous -= (pair as u32 & !duplicate).count_ones() as usize;
+            duplicate
+        })
+        .collect();
+    (repeated, ambiguous)
+}
+
 struct MarkedEvent {
     user: Key,
     ts: std::sync::atomic::AtomicU32,
@@ -104,13 +130,16 @@ impl ClaimBatch {
                 .ts
                 .store(INVALID, Relaxed);
         };
-        let screen = std::env::var_os("SHOPPING_CLAIMS").is_some_and(|s| s == "screen");
+        let strategy = std::env::var_os("SHOPPING_CLAIMS");
+        let screen = strategy.as_deref() == Some(std::ffi::OsStr::new("screen"));
+        let paired = strategy.as_deref() == Some(std::ffi::OsStr::new("pair"));
         claims.into_par_iter().for_each(|groups| {
             let n: usize = groups.iter().map(Vec::len).sum();
             if n == 0 {
                 return;
             }
             let mut conflicts = Vec::new();
+            let mut repeated = Vec::new();
             let capacity = if screen {
                 // A single sighting in this bitmap proves that no other row
                 // can have the same full key. All remaining rows still use
@@ -136,6 +165,10 @@ impl ClaimBatch {
                         conflicts[(h >> 6) & (words - 1)] >> (h & 63) & 1 != 0
                     })
                     .count()
+            } else if paired {
+                let (bitmap, ambiguous) = repeated_positions(&groups, n);
+                repeated = bitmap;
+                ambiguous
             } else {
                 n
             };
@@ -145,6 +178,12 @@ impl ClaimBatch {
                 if screen {
                     let h = (entry >> 32) as usize;
                     if conflicts[(h >> 6) & (conflicts.len() - 1)] >> (h & 63) & 1 == 0 {
+                        continue;
+                    }
+                }
+                if paired {
+                    let h = (entry >> 32) as usize;
+                    if repeated[(h >> 5) & (repeated.len() - 1)] >> (h & 31) & 1 == 0 {
                         continue;
                     }
                 }
@@ -552,6 +591,19 @@ impl InlineClaims {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_sightings_count_every_ambiguous_row() {
+        let entry = |h: u64| h << 32;
+        let groups = [
+            vec![entry(11), entry(17), entry(42)],
+            vec![entry(17), entry(42), entry(42)],
+        ];
+        let (repeated, rows) = repeated_positions(&groups, 6);
+        let bit = |h: usize| repeated[(h >> 5) & (repeated.len() - 1)] >> (h & 31) & 1;
+        assert_eq!(rows, 5);
+        assert_eq!([bit(11), bit(17), bit(42)], [0, 1, 1]);
+    }
 
     #[test]
     fn equal_fingerprints_do_not_merge_keys_or_rescue_an_invalid_winner() {
