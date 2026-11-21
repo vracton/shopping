@@ -17,12 +17,12 @@ RUN set -eu; \
     mkdir -p /tmp/profile; \
     for seed in 1 3; do \
       /tmp/gen/release/generate --seed "$seed" --events 1000000 --clicks 250000 --threads 8 --output "/tmp/input-$seed"; \
-      for mode in filter claims; do \
-        DATA_DIR="/tmp/input-$seed" OUTPUT_DIR=/tmp/output NCPU=8 \
-        SHOPPING_ARCH=indexed SHOPPING_DEDUP_MODE="$mode" SHOPPING_LINKS=sparse \
-        SHOPPING_ASSISTS=sweep SHOPPING_TIMELINES=tokens SHOPPING_SESSIONIZER=columns \
-        LLVM_PROFILE_FILE=/tmp/profile/%p-%m.profraw target/release/shopping-sessions; \
-      done; \
+      DATA_DIR="/tmp/input-$seed" OUTPUT_DIR=/tmp/output NCPU=8 \
+      SHOPPING_ARCH=indexed SHOPPING_DEDUP_MODE=claims SHOPPING_DEDUP_PARTITIONS=128 \
+      SHOPPING_LINKS=sparse SHOPPING_ASSISTS=sweep SHOPPING_EXIT=kernel \
+      SHOPPING_TIMELINES=tokens SHOPPING_SESSIONIZER=columns \
+      SHOPPING_WRITER="$SHOPPING_WRITER" SHOPPING_CLAIMS="$SHOPPING_CLAIMS" \
+      LLVM_PROFILE_FILE=/tmp/profile/%p-%m.profraw target/release/shopping-sessions; \
     done; \
     host=$(rustc -vV | sed -n 's/^host: //p'); \
     "$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata" merge /tmp/profile -o /tmp/training.profdata; \
