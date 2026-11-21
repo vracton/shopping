@@ -34,6 +34,93 @@ struct MarkedEvent {
     purchase: u32,
 }
 
+/// Build the fingerprint directory without stalling its scan on random reads
+/// from a decode tile. Defer contests until both contestants can be prefetched.
+fn mark_batched(
+    groups: &[Vec<u64>],
+    n: usize,
+    metadata: &[Vec<(Key, u64)>],
+    events: &[Vec<MarkedEvent>],
+    row_bits: u32,
+) {
+    let mut slots = vec![0u64; (n + n / 2 + 1).next_power_of_two()];
+    let mask = slots.len() - 1;
+    let row_mask = (1 << row_bits) - 1;
+    let mut pending = Vec::with_capacity(n / 16);
+    for &entry in groups.iter().flatten() {
+        let mut pos = (entry >> 32) as usize & mask;
+        loop {
+            let old = slots[pos];
+            if old == 0 {
+                slots[pos] = entry;
+                break;
+            }
+            if (entry ^ old) >> 32 == 0 {
+                pending.push((pos, entry));
+                break;
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+    let meta = |entry: u64| {
+        let loc = entry as u32 - 1;
+        &metadata[(loc >> row_bits) as usize][(loc & row_mask) as usize]
+    };
+    let payload = |entry: u64| {
+        let loc = entry as u32 - 1;
+        &events[(loc >> row_bits) as usize][(loc & row_mask) as usize]
+    };
+    let reject = |entry| {
+        payload(entry)
+            .ts
+            .store(INVALID, std::sync::atomic::Ordering::Relaxed)
+    };
+    let mut extra = FxHashMap::<Key, (u64, u64)>::default();
+    for block in pending.chunks(32) {
+        #[cfg(target_arch = "x86_64")]
+        for &(pos, new) in block {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            for entry in [slots[pos], new] {
+                unsafe {
+                    _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(meta(entry)).cast());
+                    _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(payload(entry)).cast());
+                }
+            }
+        }
+        for &(pos, entry) in block {
+            let old = slots[pos];
+            let &(a, older) = meta(old);
+            let &(b, newer) = meta(entry);
+            if a == b {
+                if newer < older {
+                    reject(old);
+                    slots[pos] = entry;
+                } else {
+                    reject(entry);
+                }
+            } else {
+                // Different full keys can share the same entire fingerprint.
+                // The first key retains the primary slot; other keys compete
+                // in their own exact table.
+                match extra.entry(b) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert((newer, entry));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let (time, previous) = *e.get();
+                        if newer < time {
+                            reject(previous);
+                            e.insert((newer, entry));
+                        } else {
+                            reject(entry)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct ClaimBatch {
     metadata: Vec<Vec<(Key, u64)>>,
     events: Vec<Vec<MarkedEvent>>,
@@ -133,9 +220,14 @@ impl ClaimBatch {
         let strategy = std::env::var_os("SHOPPING_CLAIMS");
         let screen = strategy.as_deref() == Some(std::ffi::OsStr::new("screen"));
         let paired = strategy.as_deref() == Some(std::ffi::OsStr::new("pair"));
+        let batch = strategy.as_deref() == Some(std::ffi::OsStr::new("batch"));
         claims.into_par_iter().for_each(|groups| {
             let n: usize = groups.iter().map(Vec::len).sum();
             if n == 0 {
+                return;
+            }
+            if batch {
+                mark_batched(&groups, n, &metadata, &events, row_bits);
                 return;
             }
             let mut conflicts = Vec::new();
