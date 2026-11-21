@@ -503,19 +503,39 @@ impl Calendar {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+))]
+#[path = "indexed_rows.rs"]
+mod indexed_rows;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+))]
+pub use indexed_rows::RowWindows;
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+)))]
+pub type RowWindows<'a, const N: usize> = SingleRowWindows<'a, N>;
+
 /// A row-oriented scanner that extracts every field boundary from two masks.
 /// Fixed-width loads are only used when the complete load is inside the shard.
-pub struct RowWindows<'a, const N: usize> {
+pub struct SingleRowWindows<'a, const N: usize> {
     remaining: &'a [u8],
 }
 
-impl<'a, const N: usize> RowWindows<'a, N> {
+impl<'a, const N: usize> SingleRowWindows<'a, N> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { remaining: bytes }
     }
 }
 
-impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
+impl<'a, const N: usize> Iterator for SingleRowWindows<'a, N> {
     type Item = [&'a [u8]; N];
 
     #[inline(always)]
@@ -713,6 +733,45 @@ mod tests {
             assert_eq!(
                 RowWindows::<4>::new(&bytes).collect::<Vec<_>>(),
                 rows(&bytes).filter_map(fields::<4>).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn scanners_match_scalar_across_quote_and_vector_boundaries() {
+        let mut data = Vec::new();
+        let mut state = 7_u64;
+        for pass in 0..3 {
+            data.clear();
+            for row in 0..6000 {
+                for col in 0..7 {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let quote = state >> 63 != 0;
+                    let len = (state >> 32) as usize % 17;
+                    if quote {
+                        data.push(b'"');
+                    }
+                    data.extend(std::iter::repeat_n(b'A' + col, len));
+                    if pass == 1 && row % 143 == 19 && col == 2 {
+                        data.push(b'"');
+                    }
+                    if quote {
+                        data.push(b'"');
+                    }
+                    if col != 6 {
+                        data.push(b',');
+                    }
+                }
+                if pass == 2 && row % 7 == 0 {
+                    data.extend_from_slice(b",unexpected");
+                }
+                data.push(b'\n');
+            }
+            data.extend(std::iter::repeat_n(b'x', 2200));
+            data.extend_from_slice(b",b,c,d,e,f,\"\"\nlast,b,c,d,e,f,g".as_slice());
+            assert_eq!(
+                RowWindows::<7>::new(&data).collect::<Vec<_>>(),
+                rows(&data).filter_map(fields::<7>).collect::<Vec<_>>()
             );
         }
     }
