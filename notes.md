@@ -4,7 +4,8 @@
 
 - Build a fast, exact, single-container pipeline for the [Shopping Sessions track](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions). The practice leaderboard showed **0.68 s** when checked. Practice has about 20M events and allows two submissions per hour. Finals use about 60M fresh events with a 180 s cap on each run.
 - The clock includes process startup, reading input, and writing both Parquet outputs. The scorer has 8 pinned vCPUs and 24 GB RAM. Submission requires a public repository with a root `Dockerfile`. Keep generated data outside the repository.
-- The local challenge kit has three starter skeletons, 36 fixtures per starter, and the public dev answer in `dev-answer/dev-answer/`. Those downloads and generated CSVs are excluded from Git. The Rust generator source, native container scaffold, and benchmark tools are tracked. The scaffold exits with an explicit error until the pipeline is implemented.
+- The local challenge kit has three starter skeletons, 36 fixtures per starter, and the public dev answer in `dev-answer/dev-answer/`. Those downloads and generated CSVs are excluded from Git. The Rust pipeline implements both global sort and hash-partition dedup behind the same entry point and shares validation, attribution, and Parquet writing.
+- The default is hash with 2 MiB parse chunks, 64 partitions, and 16,384 Parquet rows per group. `SHOPPING_ARCH=sort` selects the baseline with 4 MiB chunks, 32 work partitions, and 65,536 rows per group.
 
 ## Correctness to preserve
 
@@ -17,13 +18,13 @@
 
 ## Architecture options
 
-1. **Parallel sort baseline.** Resolve links with union-find. Map or read CSV shards in newline-aligned chunks and parse byte slices into compact records. Sort globally by `(event_id, ingest_ts)` to select the dedup winners, then sort the surviving events by `(canonical_person, timestamp)`. This makes correctness straightforward to inspect and provides stage timings for the next two options. Two comparison sorts can drive memory traffic and cache misses at 20M and 60M.
-2. **Hash-partition dedup and person-local sort.** Send all versions of an event ID to the same partition, compare full key bytes on collisions, and keep the earliest well-formed copy even when it fails validation. Repartition winners by canonical person and sort each partition by person and time. This keeps the global event-ID sort out of the pipeline. The tradeoffs are a scatter between stages and potential skew from whales and shared-device components. Use more work partitions than workers and account for the largest person explicitly if it becomes a bottleneck.
+1. **Parallel sort baseline (`SHOPPING_ARCH=sort`).** Resolve links with union-find, map CSV shards, and parse newline-aligned chunks in parallel. Sort globally by `(event_id, ingest_ts)` to select the dedup winners, then sort the surviving events by `(canonical_person, timestamp)`. Two comparison sorts can drive memory traffic and cache misses at 20M and 60M.
+2. **Hash-partition dedup and person-local sort (`SHOPPING_ARCH=hash`).** Send all versions of an event ID to the same partition, compare full key bytes on collisions, and keep the earliest well-formed copy even when it fails validation. Repartition winners by canonical person and sort each partition by person and time. The tradeoffs are a scatter between stages and potential skew from whales and shared-device components.
 3. **Packed keys and radix partitioning.** Use dense IDs and window-relative milliseconds where a checked representation fits. For generated-length IDs, try inline keys with an exact path for longer IDs and unusual byte values. Packed keys can make sorting and partitioning more cache-friendly. Use stage timings and 20M-scale evidence to justify this extra complexity. Keep full byte equality and byte-wise tie-breaking.
 
 For I/O, compare memory mapping with buffered parallel reads. Mapping allows byte slices to borrow input directly, while buffered reads give explicit control over scheduling and read-ahead. On either path, split large shards on newline boundaries so one worker does not inherit the largest file. Time read/parse, dedup, event ordering/sessionization, attribution/assists, and Parquet output separately. Keep pools within eight logical CPUs and measure peak RSS as well as elapsed time. One 56-byte record array at 20M rows is about 1.12 GB before duplicates and spare capacity. Budget for concurrent buffers, indexes, output writers, and the 60M final as well.
 
-For attribution, start with a sorted last-click sweep. For assists, compare a rolling active-campaign set with merging the eligibility intervals per person and campaign. Merged intervals can count session starts per day by index range, which avoids a row for every session-click combination.
+Attribution uses a sorted last-click sweep and merged eligibility intervals per person and campaign. Merged intervals count session starts per day by index range, which avoids a row for every session-click combination. The randomized unit test compares both credit and assists against a direct click scan.
 
 ## Test plan before optimization
 
@@ -31,6 +32,8 @@ For attribution, start with a sorted last-click sweep. For assists, compare a ro
 - Run all 36 fixtures with the starter harness, then compare seed 1 against the public answer with the exact Parquet comparator. Include empty-table output and assist-only campaigns.
 - Compare optimized code with a straightforward implementation on small randomized inputs. In particular, check interval assists against an explicit seven-day scan and compare the whole pipeline across input shard orders and thread counts. Seeds 2 and 3 have no supplied full-size answers. Use exact differential checks when the reference is available, and check rollup invariants in the meantime.
 - Use the three 1M seeds for the routine timing loop. Track first observation, mean, median, spread, and stage timings. Use the same CPU affinity for comparisons. Reserve 20M and 60M runs for scaling milestones and leaderboard runs for verified candidates.
+
+Current verification passed 216 fixture runs, five Rust unit tests, and exact output comparisons across both paths on the three 1M seeds and a 20M proxy. Reversing rows and redistributing seed 3 across 17 shards per input type preserved both outputs. The default `linux/amd64` image matched the public seed-1 answer with the starter's scorer-like run flags.
 
 ## Local benchmarks
 
@@ -51,12 +54,24 @@ cargo build --release --manifest-path generator/generator/Cargo.toml --target-di
 python3 scripts/bench.py scan /tmp/shopping-practice --cpus 8 --warmups 1 --repeats 5
 ```
 
-When the executable implements the pipeline, run the commands below. The harness pins itself and its child to the first requested CPUs in its allowed mask, prints individual wall times and summary statistics, and gives each run fresh output and scratch directories. Use `taskset` to select a specific CPU mask before launching the harness. `--expected` invokes the starter comparator with Polars outside the timed interval. Use `--work-dir` to put output and scratch on the filesystem you want to measure.
+For pipeline measurements, the harness pins itself and its child to the first requested CPUs in its allowed mask, prints individual wall times and summary statistics, and gives each run fresh output and scratch directories. Use `taskset` to select a specific CPU mask before launching the harness. `--expected` invokes the starter comparator with Polars outside the timed interval. Use `--work-dir` to put output and scratch on the filesystem you want to measure.
 
 ```sh
 cargo build --release --locked
+scripts/check-native.sh
 python3 scripts/bench.py run .bench/data/seed-1 --expected dev-answer/dev-answer -- ./target/release/shopping-sessions
 python3 scripts/bench.py run /tmp/shopping-practice --cpus 8 --warmups 1 --repeats 5 -- ./target/release/shopping-sessions
+```
+
+`check-native.sh` checks each architecture on the 36 fixtures with three settings, compares the two architectures on seeds 1–3, and compares seed 1 to the public answer. It needs the downloaded DuckDB starter files and Polars. Set `PYTHON`, `STARTER_DIR`, `DATA_ROOT`, or `PUBLIC_ANSWER` to select a different environment or dataset location.
+
+Set `BENCH_STAGES=1` for timings by stage. The performance settings are `SHOPPING_CHUNK_KIB`, `SHOPPING_PARTITIONS`, `SHOPPING_PARQUET_ROWS`, and `NCPU`. `sweep-native.py` warms the data and interleaves candidates in seeded order. It takes repeated `--candidate ARCH,CHUNK_KIB,PARTITIONS,PARQUET_ROWS,WORKERS` options to recheck finalists.
+
+```sh
+python3 scripts/sweep-native.py .bench/data/seed-2 --repeats 4 > .bench/sweep.csv
+python3 scripts/sweep-native.py .bench/data/seed-1 .bench/data/seed-2 .bench/data/seed-3 --repeats 5 \
+    --candidate sort,4096,32,65536,8 --candidate hash,2048,64,16384,8 \
+    --candidate hash,2048,64,65536,8 > .bench/finalists.csv
 ```
 
 The scan reads all input bytes into reusable buffers. It does no parsing and leaves the OS page cache in its natural state. Report the first observation and the repeated measurements separately. The command benchmark uses host execution with CPU affinity. Use the starter Docker runner as a separate check for scorer-like container limits and startup.
@@ -79,3 +94,23 @@ Seed 2, 20M events and 5M clicks, **1,901,148,800 bytes across 117 files**, meas
 | 1 CPU | 0.263 s | 0.152 s |
 
 The repeated scan gives a local I/O reference. The 0.68 s leaderboard score is end to end and measured on different hardware and data.
+
+### Native pipeline measurements
+
+The one-factor sweep tried 32 configurations on seed 2 with four repeats per configuration. It varied chunk size from 256 KiB to 8 MiB, partitions from 7 to 128, row groups from 4,096 to 262,144 rows, and worker count from one to eight. Confirmation used eight candidates, three seeds, and five interleaved repeats per seed. All numbers below are host process wall time on CPUs 0–7. The pooled summaries use all 15 runs per candidate.
+
+| Architecture | Chunk | Partitions | Parquet rows | Mean | Median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Sort | 4 MiB | 32 | 65,536 | 436 ms | 422 ms |
+| Hash | 2 MiB | 64 | 16,384 | 214 ms | 209 ms |
+| Hash | 2 MiB | 64 | 65,536 | 213 ms | 216 ms |
+
+The finalists also ran three times each on the existing 20M-event seed-2 proxy. Results varied substantially on the local WSL2 host, especially during the first two runs. Use these as scale and memory checks. They have no controlled cache reset, and the local machine has about 8 GiB RAM.
+
+| Architecture and row group | Individual wall times | Median | Peak RSS across runs |
+| --- | --- | ---: | ---: |
+| Sort, 65,536 | 27.20 s, 14.40 s, 15.94 s | 15.94 s | 4.26 GiB |
+| Hash, 16,384 | 27.09 s, 6.80 s, 6.79 s | 6.80 s | 4.39 GiB |
+| Hash, 65,536 | 7.02 s, 9.30 s, 6.62 s | 7.02 s | 4.38 GiB |
+
+In the 6.79 s hash run, parsing and partitioning took 1.80 s, dedup and redistribution 1.30 s, local ordering 1.74 s, and Parquet writing 0.14 s. Parsing and ordering are the first places to investigate for further speedups. The 60M final scale has yet to be measured.

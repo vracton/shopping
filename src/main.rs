@@ -44,7 +44,7 @@ impl Config {
             .map(usize::from)
             .unwrap_or(1);
         let workers = positive_setting("NCPU", available.min(8))?;
-        let architecture = match env::var("SHOPPING_ARCH").as_deref().unwrap_or("sort") {
+        let architecture = match env::var("SHOPPING_ARCH").as_deref().unwrap_or("hash") {
             "sort" => Architecture::Sort,
             "hash" => Architecture::Hash,
             value => {
@@ -53,17 +53,21 @@ impl Config {
                 );
             }
         };
+        let (chunk_kib, partitions, parquet_rows) = match architecture {
+            Architecture::Sort => (4096, 32, 65_536),
+            Architecture::Hash => (2048, 64, 16_384),
+        };
         Ok(Self {
             data: env::var_os("DATA_DIR").map_or_else(|| PathBuf::from("/data"), PathBuf::from),
             output: env::var_os("OUTPUT_DIR")
                 .map_or_else(|| PathBuf::from("/output"), PathBuf::from),
             architecture,
             workers,
-            chunk_bytes: positive_setting("SHOPPING_CHUNK_KIB", 2048)?
+            chunk_bytes: positive_setting("SHOPPING_CHUNK_KIB", chunk_kib)?
                 .checked_mul(1024)
                 .ok_or("SHOPPING_CHUNK_KIB is too large")?,
-            partitions: positive_setting("SHOPPING_PARTITIONS", 32)?,
-            parquet_rows: positive_setting("SHOPPING_PARQUET_ROWS", 65_536)?,
+            partitions: positive_setting("SHOPPING_PARTITIONS", partitions)?,
+            parquet_rows: positive_setting("SHOPPING_PARQUET_ROWS", parquet_rows)?,
         })
     }
 }
