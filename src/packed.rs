@@ -17,6 +17,9 @@ mod split;
 
 #[path = "packed_claims.rs"]
 mod claims;
+#[path = "packed_clicks.rs"]
+mod click_routing;
+use click_routing::ClickInput;
 
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
@@ -991,7 +994,7 @@ enum EventInput {
 
 pub struct Parsed {
     events: EventInput,
-    clicks: Vec<Vec<Click>>,
+    clicks: ClickInput,
     links: Aliases,
     base: i64,
     first_day: i32,
@@ -1098,7 +1101,24 @@ pub fn parse_inputs(
         let events = Stages::span(profile, "split_decode", || {
             split::decode(events, &parser, &links, count, dedup_count, window_rows)
         })?;
-        (EventInput::ByPerson(events), clicks?, links)
+        (EventInput::ByPerson(events), ClickInput::ByChunk(clicks?), links)
+    } else if indexed && std::env::var_os("SHOPPING_CLICK_ROUTE").is_some_and(|s| s == "parse")
+        && std::env::var_os("SHOPPING_DEDUP_MODE").is_some_and(|s| s == "claims")
+    {
+        let (events, routed) = rayon::join(
+            || Stages::span(profile, "event_decode_and_scatter", || {
+                claims::ClaimBatch::parse(events, dedup_count, &parser, window_rows)
+            }),
+            || {
+                let links = decode_links()?;
+                let clicks = Stages::span(profile, "click_decode_and_route", || {
+                    ClickInput::decode_routed(clicks, &parser, &links, count, window_rows)
+                })?;
+                Some((clicks, links))
+            },
+        );
+        let (clicks, links) = routed?;
+        (EventInput::Claims(events?), clicks, links)
     } else {
         let ((events, clicks), links) = rayon::join(
             || {
@@ -1132,7 +1152,7 @@ pub fn parse_inputs(
             },
             decode_links,
         );
-        (events?, clicks?, links?)
+        (events?, ClickInput::ByChunk(clicks?), links?)
     };
     Some(Parsed {
         events,
@@ -1186,6 +1206,10 @@ impl Parsed {
             },
             || {
                 Stages::span(profile, "click_alias_and_route", || {
+                    let clicks = match clicks {
+                        ClickInput::ByPerson(parts) => return parts,
+                        ClickInput::ByChunk(clicks) => clicks,
+                    };
                     clicks
                         .into_par_iter()
                         .map(|group| {
