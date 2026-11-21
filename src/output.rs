@@ -11,7 +11,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use rayon::prelude::*;
 
 use crate::Result;
-use crate::aggregate::{CampaignStats, Daily, UserDay, UserId};
+use crate::aggregate::{CampaignDaily, CampaignStats, Daily, UserDay, UserId};
 use crate::catalog::Catalog;
 
 #[path = "output_pages.rs"]
@@ -159,18 +159,51 @@ fn write_users(
         })
 }
 
+fn campaign_rows(partitions: &[Daily<'_>]) -> Vec<((usize, i32), CampaignStats)> {
+    if let Some(CampaignDaily::Dense {
+        first,
+        days,
+        values,
+    }) = partitions.first().map(|p| &p.campaigns)
+    {
+        let compatible = partitions.iter().all(|part| {
+            matches!(&part.campaigns,
+                CampaignDaily::Dense { first: f, days: d, values: v }
+                if f == first && d == days && v.len() == values.len()
+            )
+        });
+        if compatible {
+            let mut total = values.clone();
+            for part in &partitions[1..] {
+                if let CampaignDaily::Dense { values, .. } = &part.campaigns {
+                    for (sum, item) in total.iter_mut().zip(values) {
+                        *sum += item.clone();
+                    }
+                }
+            }
+            return total
+                .into_iter()
+                .enumerate()
+                .filter(|(_, s)| s.sessions != 0 || s.assisted_sessions != 0)
+                .map(|(i, stats)| ((i / days, first + (i % days) as i32), stats))
+                .collect();
+        }
+    }
+    let mut totals: rustc_hash::FxHashMap<_, CampaignStats> = rustc_hash::FxHashMap::default();
+    for part in partitions {
+        part.campaigns
+            .for_each(|key, stats| *totals.entry(key).or_default() += stats);
+    }
+    totals.into_iter().collect()
+}
+
 fn write_campaigns(
     path: &Path,
     partitions: &[Daily<'_>],
     catalog: &Catalog<'_>,
     row_group: usize,
 ) -> Result<()> {
-    let mut totals: rustc_hash::FxHashMap<_, CampaignStats> = rustc_hash::FxHashMap::default();
-    for part in partitions {
-        part.campaigns
-            .for_each(|key, stats| *totals.entry(key).or_default() += stats);
-    }
-    let rows: Vec<_> = totals.into_iter().collect();
+    let rows = campaign_rows(partitions);
     let schema = campaign_schema();
     let mut writer = file_writer(&path.join("part-0.parquet"), Arc::clone(&schema), row_group)?;
     for rows in rows.chunks(row_group) {
