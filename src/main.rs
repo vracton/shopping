@@ -171,7 +171,8 @@ fn run(config: &Config) -> Result<()> {
         ) {
             stages.mark("packed_parse_and_links");
             drop((event_chunks, click_chunks, link_chunks));
-            let fast_exit = env::var_os("SHOPPING_EXIT").is_some_and(|value| value == "kernel");
+            let exit = env::var("SHOPPING_EXIT").unwrap_or_default();
+            let fast_exit = matches!(exit.as_str(), "kernel" | "unmap");
             let mut resources = Some((event_maps, click_maps, links));
             let bucket_output =
                 output::BucketOutput::prepare(&config.output, &catalog, config.parquet_rows)?;
@@ -184,7 +185,7 @@ fn run(config: &Config) -> Result<()> {
                     bucket_output.as_ref(),
                 )
             };
-            let (daily, users_written) = if fast_exit {
+            let (daily, users_written) = if exit == "kernel" {
                 aggregate()
             } else {
                 rayon::join(|| drop(resources.take()), aggregate).1
