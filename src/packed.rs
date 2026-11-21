@@ -156,6 +156,7 @@ enum Aliases {
     Serial(Links),
     Sharded(Vec<FxHashMap<Key, Key>>),
     Sparse(sparse_links::Sparse),
+    Tokens(tokens::Directory),
 }
 
 impl Aliases {
@@ -163,6 +164,7 @@ impl Aliases {
         match self {
             Self::Serial(links) => links.resolve(key),
             Self::Sparse(links) => links.resolve(key),
+            Self::Tokens(directory) => directory.resolve(key),
             Self::Sharded(parts) => parts[bucket(key, parts.len())]
                 .get(&key)
                 .copied()
@@ -1014,7 +1016,6 @@ pub struct Parsed {
     events: EventInput,
     clicks: Vec<Vec<Click>>,
     links: Aliases,
-    tokens: Option<tokens::Directory>,
     base: i64,
     first_day: i32,
     days: usize,
@@ -1101,22 +1102,22 @@ pub fn parse_inputs(
                 && std::env::var_os("SHOPPING_LINKS").as_deref()
                     == Some(std::ffi::OsStr::new("sparse"))
             {
-                let links = sparse_links::Sparse::new(link_chunks)?;
-                let directory =
-                    if std::env::var_os("SHOPPING_TIMELINES").is_some_and(|x| x == "tokens") {
-                        let bytes: usize = events.iter().map(|s| s.len()).sum();
-                        tokens::Directory::new(&links, bytes, count)
-                    } else {
-                        None
-                    };
-                Some((Aliases::Sparse(links), directory))
+                if std::env::var_os("SHOPPING_TIMELINES").is_some_and(|x| x == "tokens")
+                    && std::env::var_os("SHOPPING_DEDUP_MODE").is_some_and(|x| x == "claims")
+                {
+                    let bytes: usize = events.iter().map(|s| s.len()).sum();
+                    if let Some(directory) = tokens::Directory::new(link_chunks, bytes, count) {
+                        return Some(Aliases::Tokens(directory));
+                    }
+                }
+                sparse_links::Sparse::new(link_chunks).map(Aliases::Sparse)
             } else if indexed
                 && std::env::var_os("SHOPPING_LINKS").as_deref()
                     == Some(std::ffi::OsStr::new("parallel"))
             {
-                Aliases::parallel(link_chunks).map(|links| (links, None))
+                Aliases::parallel(link_chunks)
             } else {
-                Links::new(link_files.iter().copied()).map(|links| (Aliases::Serial(links), None))
+                Links::new(link_files.iter().copied()).map(Aliases::Serial)
             }
         })
     };
@@ -1124,11 +1125,11 @@ pub fn parse_inputs(
         && std::env::var_os("SHOPPING_ROUTE").as_deref() == Some(std::ffi::OsStr::new("split"));
     let (events, clicks, links) = if split_route {
         let (links, clicks) = rayon::join(decode_links, decode_clicks);
-        let (links, directory) = links?;
+        let links = links?;
         let events = Stages::span(profile, "split_decode", || {
             split::decode(events, &parser, &links, count, dedup_count, window_rows)
         })?;
-        (EventInput::ByPerson(events), clicks?, (links, directory))
+        (EventInput::ByPerson(events), clicks?, links)
     } else {
         let ((events, clicks), links) = rayon::join(
             || {
@@ -1164,9 +1165,7 @@ pub fn parse_inputs(
         );
         (events?, clicks?, links?)
     };
-    let (links, tokens) = links;
     Some(Parsed {
-        tokens,
         events,
         clicks,
         links,
@@ -1191,13 +1190,13 @@ impl Parsed {
             base,
             first_day,
             days,
-            tokens,
         } = self;
-        if let Some(directory) = tokens
-            && let EventInput::Claims(batch) = events
-        {
-            return directory.aggregate(batch, clicks, base, first_day, days, organic, stages);
-        }
+        let (events, links) = match (events, links) {
+            (EventInput::Claims(batch), Aliases::Tokens(directory)) => {
+                return directory.aggregate(batch, clicks, base, first_day, days, organic, stages);
+            }
+            other => other,
+        };
         let choose = if !indexed {
             dedup
         } else if std::env::var_os("SHOPPING_DEDUP_MODE").as_deref()

@@ -5,10 +5,6 @@ use super::{Key, RowWindows};
 pub(super) struct Sparse(Vec<(Key, Key)>);
 
 impl Sparse {
-    pub(super) fn aliases(&self) -> impl Iterator<Item = (Key, Key)> + '_ {
-        self.0.iter().copied().filter(|entry| entry.0.0 != 0)
-    }
-
     #[inline]
     pub(super) fn prefetch(&self, key: Key) {
         #[cfg(target_arch = "x86_64")]
@@ -139,6 +135,7 @@ mod tests {
                 .split_inclusive(|&byte| byte == b'\n')
                 .collect();
             let table = Sparse::new(&chunks).unwrap();
+            let tokens = super::super::tokens::Directory::new(&chunks, 4 << 20, 8).unwrap();
             for name in names
                 .iter()
                 .map(String::as_bytes)
@@ -146,6 +143,7 @@ mod tests {
             {
                 let key = Key::pack(name).unwrap();
                 assert_eq!(table.resolve(key), reference.resolve(key), "{name:?}");
+                assert_eq!(tokens.resolve(key), reference.resolve(key), "{name:?}");
             }
         }
     }

@@ -14,7 +14,7 @@ pub(super) struct Directory {
 }
 
 impl Directory {
-    pub(super) fn new(links: &sparse_links::Sparse, bytes: usize, parts: usize) -> Option<Self> {
+    pub(super) fn new(chunks: &[&[u8]], bytes: usize, parts: usize) -> Option<Self> {
         // Size is only a space/time heuristic. Every identity that cannot get
         // a slot takes the full-key path. Cap this auxiliary table at 96 MiB.
         let size = (bytes / 768)
@@ -31,13 +31,80 @@ impl Directory {
             shift: (size / parts).trailing_zeros(),
             parts,
         };
-        for (name, root) in links.aliases() {
-            let root_slot = table.intern(root)?;
-            let alias_slot = table.intern(name)?;
-            *table.keys[alias_slot].get_mut() = name.0 | REDIRECT;
-            table.roots[alias_slot] = root_slot as u32;
+        // During union, zero is a root; a nonzero parent is slot + 1.
+        // A child is linked only to a current root. Reversing the joins
+        // therefore makes every parent's final slot available before its children.
+        let mut joined = Vec::new();
+        for chunk in chunks {
+            for [left, right] in RowWindows::<2>::new(chunk) {
+                if left.is_empty() || right.is_empty() {
+                    continue;
+                }
+                let (a, b) = (Key::pack(left)?, Key::pack(right)?);
+                if a == b {
+                    continue;
+                }
+                let a = table.insert(a)?;
+                let b = table.insert(b)?;
+                let a = table.root(a);
+                let b = table.root(b);
+                if a != b {
+                    let (child, parent) = if *table.keys[a].get_mut() > *table.keys[b].get_mut() {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    table.roots[child] = parent as u32 + 1;
+                    joined.push(child);
+                }
+            }
+        }
+        for child in joined.into_iter().rev() {
+            let parent = table.roots[child] as usize - 1;
+            let root = if *table.keys[parent].get_mut() & REDIRECT != 0 {
+                table.roots[parent]
+            } else {
+                parent as u32
+            };
+            *table.keys[child].get_mut() |= REDIRECT;
+            table.roots[child] = root;
         }
         Some(table)
+    }
+
+    fn insert(&mut self, key: Key) -> Option<usize> {
+        let mask = self.keys.len() - 1;
+        let mut i = key.hash() as usize & mask;
+        for _ in 0..PROBES {
+            let tag = self.keys[i].get_mut();
+            if *tag == key.0 {
+                return Some(i);
+            }
+            if *tag == 0 {
+                *tag = key.0;
+                return Some(i);
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+
+    fn root(&mut self, mut i: usize) -> usize {
+        while self.roots[i] != 0 {
+            let parent = self.roots[i] as usize - 1;
+            let grandparent = self.roots[parent];
+            if grandparent == 0 {
+                return parent;
+            }
+            self.roots[i] = grandparent;
+            i = grandparent as usize - 1;
+        }
+        i
+    }
+
+    pub(super) fn resolve(&self, key: Key) -> Key {
+        self.intern(key)
+            .map_or(key, |slot| Key(self.keys[slot].load(Relaxed)))
     }
 
     #[inline(always)]
@@ -352,8 +419,7 @@ mod tests {
 
     #[test]
     fn redirects_and_colliding_singletons_remain_distinct_across_workers() {
-        let links = sparse_links::Sparse::new(&[b"c,b\nb,a\nd,c\na,b\n"]).unwrap();
-        let table = Directory::new(&links, 1, 4).unwrap();
+        let table = Directory::new(&[b"c,b\nb,a\nd,c\na,b\n"], 1, 4).unwrap();
         let key = |s: &[u8]| Key::pack(s).unwrap();
         let canonical = table.intern(key(b"a")).unwrap();
         for name in [b"a", b"b", b"c", b"d"] {
