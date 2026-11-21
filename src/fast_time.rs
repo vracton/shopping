@@ -6,6 +6,18 @@ const DIGITS: u64 = 0x0f0f_0f0f_0f0f_0f0f;
 const TIME_NIBBLES: u64 = 0x0f0f_000f_0f00_0f0f;
 const DAY_NIBBLES: u64 = 0x0f0f_0f0f_000f_0f00;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+))]
+#[derive(Clone, Copy, Default)]
+struct Month {
+    prefix: u64,
+    first_day: i32,
+    length: i16,
+}
+
 #[derive(Clone, Copy, Default)]
 struct DateAtom {
     prefix: u64,
@@ -14,6 +26,12 @@ struct DateAtom {
 }
 
 pub struct FastTime {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "ssse3",
+        target_feature = "sse4.1"
+    ))]
+    months: [Month; 16],
     atoms: [DateAtom; 128],
     cutoffs: Vec<u64>,
 }
@@ -31,9 +49,36 @@ impl FastTime {
             .collect();
         let mut result = Self {
             atoms: [DateAtom::default(); 128],
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                target_feature = "sse4.1"
+            ))]
+            months: [Month::default(); 16],
             cutoffs,
         };
         for (year, month, day, epoch_day) in calendar.nearby_dates() {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "ssse3",
+                target_feature = "sse4.1"
+            ))]
+            {
+                let first_day = epoch_day - (day as i64 - 1);
+                if first_day <= end.div_euclid(DAY_MS) + 1
+                    && first_day + 31 >= base.div_euclid(DAY_MS) - 1
+                {
+                    let date = format!("{year:04}-{month:02}-");
+                    if let Ok(prefix) = date.as_bytes().try_into() {
+                        let prefix = u64::from_le_bytes(prefix);
+                        result.months[(prefix >> 48) as usize & 15] = Month {
+                            prefix,
+                            first_day: first_day as i32,
+                            length: day as i16,
+                        };
+                    }
+                }
+            }
             if epoch_day < base.div_euclid(DAY_MS) - 1 || epoch_day > end.div_euclid(DAY_MS) + 1 {
                 continue;
             }
@@ -78,6 +123,41 @@ impl FastTime {
 
     #[inline(always)]
     pub fn timestamp(&self, bytes: &[u8], calendar: &Calendar) -> Option<i64> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "ssse3",
+            target_feature = "sse4.1"
+        ))]
+        if matches!(bytes.len(), 20 | 25) {
+            let prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let month = self.months[(prefix >> 48) as usize & 15];
+            // The last month digit only selects a slot. Compare YYYY-MM-
+            // before interpreting the rest of the timestamp relative to it.
+            if month.length != 0 && month.prefix == prefix {
+                let offset = match (bytes.len(), bytes[19]) {
+                    (20, b'Z') => 0,
+                    (25, sign @ (b'+' | b'-')) if bytes[22] == b':' => {
+                        let pair = |i: usize| {
+                            let a = bytes[i].wrapping_sub(b'0');
+                            let b = bytes[i + 1].wrapping_sub(b'0');
+                            (a < 10 && b < 10).then_some(i64::from(a) * 10 + i64::from(b))
+                        };
+                        let (h, m) = (pair(20)?, pair(23)?);
+                        if h >= 24 || m >= 60 {
+                            return None;
+                        }
+                        let seconds = (h * 60 + m) * 60;
+                        if sign == b'+' { seconds } else { -seconds }
+                    }
+                    _ => return None,
+                };
+                // Both accepted ISO spellings contain bytes 3 through 18.
+                let second = unsafe { month_seconds(bytes, month.length) }?;
+                return Some(
+                    i64::from(month.first_day) * DAY_MS + (i64::from(second) - offset) * 1000,
+                );
+            }
+        }
         match bytes.len() {
             13 => {
                 let head = u64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -120,6 +200,40 @@ impl FastTime {
             }
             _ => calendar.timestamp(bytes),
         }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+))]
+#[inline(always)]
+unsafe fn month_seconds(bytes: &[u8], days: i16) -> Option<i32> {
+    use std::arch::x86_64::*;
+    unsafe {
+        // The low five lanes have already been checked against the month.
+        // The other eleven must match DDThh:mm:ss, including punctuation.
+        let value = _mm_loadu_si128(bytes.as_ptr().add(3).cast());
+        let zero = _mm_setr_epi8(0, 0, 0, 0, 0, 48, 48, 84, 48, 48, 58, 48, 48, 58, 48, 48);
+        let digits = _mm_sub_epi8(value, zero);
+        let limit = _mm_setr_epi8(-1, -1, -1, -1, -1, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9);
+        let bad = _mm_subs_epu8(digits, limit);
+        let pairs = _mm_shuffle_epi8(
+            digits,
+            _mm_setr_epi8(5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1),
+        );
+        let values = _mm_maddubs_epi16(pairs, _mm_set1_epi16(0x010a));
+        // Zero-base the day. Day 00 wraps above the unsigned upper bound.
+        let values = _mm_sub_epi16(values, _mm_setr_epi16(1, 0, 0, 0, 0, 0, 0, 0));
+        let range = _mm_subs_epu16(values, _mm_setr_epi16(days - 1, 23, 59, 59, 0, 0, 0, 0));
+        let errors = _mm_or_si128(bad, range);
+        if _mm_testz_si128(errors, errors) == 0 {
+            return None;
+        }
+        // First pair yields minutes since month start, second pair seconds in hour.
+        let totals = _mm_madd_epi16(values, _mm_setr_epi16(1440, 60, 60, 1, 0, 0, 0, 0));
+        Some(_mm_cvtsi128_si32(totals) * 60 + _mm_extract_epi32::<1>(totals))
     }
 }
 
