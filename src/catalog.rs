@@ -28,7 +28,10 @@ impl<'a> Catalog<'a> {
         let mut category_ids = FxHashMap::default();
         category_ids.insert(names[0], 0);
         let body = without_header(products);
-        let rows = memchr::memchr_iter(b'\n', body).count();
+        // Limit the initial allocation when the file consists mostly of
+        // malformed records or repeated IDs. Further insertions grow normally.
+        let sample = &body[..body.len().min(1024 * 1024)];
+        let rows = memchr::memchr_iter(b'\n', sample).count().min(65_536);
         let mut products_by_id = FxHashMap::with_capacity_and_hasher(rows, Default::default());
         for [id, category] in RowWindows::<2>::new(body) {
             let number = *category_ids.entry(category).or_insert_with(|| {
