@@ -251,9 +251,9 @@ impl<'a> BucketOutput<'a> {
 
     // Purchases may refer to any day of the current shopper. Flush at a
     // shopper boundary so those updates are complete before encoding a page.
-    pub(crate) fn flush_columns(&self, part: &mut PartWriter, finish: bool) -> Result<()> {
+    pub(crate) fn flush_columns(&self, part: &mut PartWriter, reserve: usize) -> Result<()> {
         let len = part.columns.len();
-        if len == 0 || (!finish && len < self.rows) {
+        if len == 0 || len.saturating_add(reserve) <= self.rows {
             return Ok(());
         }
         let mut columns = std::mem::take(&mut part.columns);

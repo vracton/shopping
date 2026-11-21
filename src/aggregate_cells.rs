@@ -10,6 +10,11 @@ const CELLS: usize = (u32::MAX >> SHIFT) as usize + 1;
 const _: () = assert!((1 << SHIFT) - 1 <= SESSION_GAP_MS);
 const WORDS: usize = CELLS.div_ceil(64);
 const DAYS: usize = u32::MAX as usize / DAY_MS as usize + 2;
+// Consecutive session starts differ by at least GAP + 1 milliseconds.
+const MAX_SESSIONS: u32 = u32::MAX / (SESSION_GAP_MS as u32 + 1) + 1;
+const SESSION_BITS: u32 = MAX_SESSIONS.next_power_of_two().trailing_zeros();
+const SESSION_MASK: u32 = (1 << SESSION_BITS) - 1;
+const _: () = assert!((DAYS as u32) <= (u32::MAX >> SESSION_BITS));
 const CATEGORIES: usize = 256;
 const _: () = assert!(WORDS <= 64);
 
@@ -31,7 +36,7 @@ impl Cell {
 pub(super) struct Cells {
     slots: Vec<Cell>,
     occupancy: [u64; WORDS],
-    owners: Vec<usize>,
+    owners: Vec<u32>,
     touched_categories: Vec<usize>,
     by_category: Vec<i64>,
 }
@@ -74,8 +79,9 @@ impl Cells {
         }
 
         sessions.clear();
-        let mut row_indices = [0; DAYS];
-        let base_day = day(base);
+        let first_row = output.len();
+        let mut day_ordinal = 0u32;
+        let mut owner = 0;
         let mut current_day = i32::MIN;
         let mut day_sessions = 0i64;
         let mut day_events = 0i64;
@@ -94,12 +100,13 @@ impl Cells {
                     if current_day != session_day || day_sessions == 0 {
                         if day_sessions != 0 {
                             output.append(user, current_day, day_sessions, day_events);
+                            day_ordinal += 1;
                         }
                         current_day = session_day;
-                        row_indices[(session_day - base_day) as usize] = output.len();
                         day_sessions = 0;
                         day_events = 0;
                     }
+                    owner = (day_ordinal << SESSION_BITS) | sessions.len() as u32;
                     sessions.push(Session {
                         start,
                         day: session_day,
@@ -110,7 +117,7 @@ impl Cells {
                 day_events += cell.count as i64;
                 previous_end = i64::from(cell.last);
                 *cell = Cell::EMPTY;
-                self.owners[index] = sessions.len() - 1;
+                self.owners[index] = owner;
             }
         }
         if day_sessions != 0 {
@@ -123,9 +130,10 @@ impl Cells {
             }
             let category = category as usize;
             let index = ((event.timestamp() as u32) >> SHIFT) as usize;
-            let session = &mut sessions[self.owners[index]];
-            let offset = (session.day - base_day) as usize;
-            let (revenue, top_category) = output.purchase(row_indices[offset]);
+            let owner = self.owners[index];
+            let session = &mut sessions[(owner & SESSION_MASK) as usize];
+            let offset = (owner >> SESSION_BITS) as usize;
+            let (revenue, top_category) = output.purchase(first_row + offset);
             let price = i64::from(price);
             *revenue += price;
             session.revenue += price;

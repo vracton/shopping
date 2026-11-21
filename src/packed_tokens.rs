@@ -404,7 +404,7 @@ impl Directory {
                     }
                 }
                 if let (Some(out), Some(mut writer)) = (output, writer) {
-                    out.flush_columns(&mut writer, true)?;
+                    out.flush_columns(&mut writer, usize::MAX)?;
                     writer.close()?;
                 }
                 Ok(daily)
@@ -563,9 +563,14 @@ impl Part {
                 if WIDTH == 3 {
                     clicks.sort_unstable_by_key(|click| (click.ts, click.id));
                     if let Some((output, writer)) = direct.as_mut() {
+                        let plain = &times[start[0]..end[0]];
+                        // A u32 timestamp span covers at most this many UTC dates.
+                        let max_dates = u32::MAX as usize / crate::input::DAY_MS as usize + 2;
+                        output
+                            .flush_columns(writer, (plain.len() + events.len()).min(max_dates))?;
                         counted.scratch.try_cell_days(
                             name,
-                            &times[start[0]..end[0]],
+                            plain,
                             events,
                             clicks,
                             organic,
@@ -573,7 +578,6 @@ impl Part {
                             &mut writer.columns,
                             &mut out.campaigns,
                         );
-                        output.flush_columns(writer, false)?;
                     } else {
                         counted.scratch.try_cells(
                             UserId::Packed(name),
