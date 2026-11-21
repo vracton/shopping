@@ -1,0 +1,8 @@
+/target/
+/generator/generator/target/
+/.bench/
+/dev-answer/
+/starter-duckdb/
+/starter-polars/
+/starter-pyspark/
+__pycache__/
