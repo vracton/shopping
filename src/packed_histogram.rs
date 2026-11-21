@@ -50,11 +50,11 @@ impl Timelines {
                     self.counts[bucket(e.user)].events += 1;
                 }
             }
-            let mut capacity = 0usize;
+            let mut capacity = 0u64;
             for count in &mut self.counts {
-                let estimate = 8 + 12 * count.events as usize;
+                let estimate = 8 + 12 * u64::from(count.events);
                 capacity += estimate;
-                if capacity > rows * 4 {
+                if capacity > rows as u64 * 4 {
                     counted.run((events, clicks), organic, base, out);
                     return;
                 }
