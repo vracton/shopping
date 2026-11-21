@@ -140,21 +140,30 @@ fn run(config: &Config) -> Result<()> {
             chunks(files, config.chunk_bytes)
         }
     };
-    let (event_chunks, click_chunks) = rayon::join(
-        || input_chunks(&event_maps[..]),
-        || input_chunks(&click_maps[..]),
-    );
-    let link_chunks = chunks(&links, config.chunk_bytes);
-    stages.mark("chunk_boundaries");
-    if matches!(
+    let packed = matches!(
         config.architecture,
         Architecture::Packed | Architecture::Indexed
-    ) {
-        let catalog = Catalog::new(
-            std::iter::empty(),
-            products.as_deref().unwrap_or_default(),
-            campaigns.as_deref().unwrap_or_default(),
-        );
+    );
+    let ((event_chunks, click_chunks), catalog) = rayon::join(
+        || {
+            rayon::join(
+                || input_chunks(&event_maps[..]),
+                || input_chunks(&click_maps[..]),
+            )
+        },
+        || {
+            packed.then(|| {
+                Catalog::new(
+                    std::iter::empty(),
+                    products.as_deref().unwrap_or_default(),
+                    campaigns.as_deref().unwrap_or_default(),
+                )
+            })
+        },
+    );
+    let link_chunks = chunks(&links, config.chunk_bytes);
+    stages.mark("chunk_boundaries_and_catalog");
+    if let Some(catalog) = catalog {
         if let Some(parsed) = packed::parse_inputs(
             &event_chunks,
             &click_chunks,
