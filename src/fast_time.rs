@@ -1,6 +1,8 @@
 //! Keep trusted ingest timestamps in sortable decimal form and recognize
 //! in-window UTC dates by their exact bytes.
 use crate::input::{Calendar, DAY_MS};
+#[path = "isa_time.rs"]
+mod isa_time;
 
 const DIGITS: u64 = 0x0f0f_0f0f_0f0f_0f0f;
 const TIME_NIBBLES: u64 = 0x0f0f_000f_0f00_0f0f;
@@ -88,7 +90,7 @@ impl FastTime {
                         as i64,
                 )
             }
-            20 if bytes[10] == b'T' && bytes[19] == b'Z' => {
+            20 | 25 if bytes[4] == b'-' && bytes[10] == b'T' => {
                 let prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
                 let day = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
                 let mut index = date_slot(prefix, day);
@@ -104,19 +106,7 @@ impl FastTime {
                     }
                     index = (index + 1) & 127;
                 };
-                let clock = u64::from_be_bytes(bytes[11..19].try_into().unwrap());
-                const DIGIT_BYTES: u64 = 0xffff_00ff_ff00_ffff;
-                if (clock & !DIGIT_BYTES) != 0x0000_3a00_003a_0000
-                    || !ascii_digits(clock, DIGIT_BYTES)
-                {
-                    return None;
-                }
-                let code = extract(clock, TIME_NIBBLES);
-                let (hour, minute, second) = clock_parts(code);
-                if hour >= 24 || minute >= 60 || second >= 60 {
-                    return None;
-                }
-                Some(epoch_day * DAY_MS + ((hour * 3600 + minute * 60 + second) * 1000) as i64)
+                Some(epoch_day * DAY_MS + isa_time::wall_seconds(bytes)? * 1000)
             }
             _ => calendar.timestamp(bytes),
         }
