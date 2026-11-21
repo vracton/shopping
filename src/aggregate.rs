@@ -5,6 +5,8 @@ use rustc_hash::FxHashMap;
 use crate::ingest::{Batches, Click, Event};
 use crate::input::{DAY_MS, WEEK_MS};
 
+#[path = "aggregate_masks.rs"]
+mod masks;
 #[path = "aggregate_sweep.rs"]
 mod merged;
 
@@ -101,6 +103,7 @@ pub trait TimedEvent {
 pub trait TimedClick {
     fn timestamp(&self) -> i64;
     fn campaign(&self) -> usize;
+    fn smaller_id(&self, other: &Self) -> bool;
 }
 
 impl TimedEvent for Event<'_> {
@@ -113,6 +116,9 @@ impl TimedEvent for Event<'_> {
 }
 
 impl TimedClick for Click<'_> {
+    fn smaller_id(&self, other: &Self) -> bool {
+        self.id < other.id
+    }
     fn timestamp(&self) -> i64 {
         self.ts
     }
@@ -199,9 +205,19 @@ pub struct Person {
     bins: TimeBins,
     assist_ends: Option<Vec<usize>>,
     merged: Option<merged::Sweep>,
+    masks: Option<masks::Attribution>,
 }
 
 impl Person {
+    pub fn with_click_masks() -> Self {
+        Self {
+            masks: Some(masks::Attribution::default()),
+            ..Self::default()
+        }
+    }
+    pub fn needs_click_order(&self) -> bool {
+        self.masks.is_none()
+    }
     pub fn with_merged_sweep(campaigns: usize) -> Self {
         Self {
             merged: Some(merged::Sweep::new(campaigns)),
@@ -338,6 +354,18 @@ impl Person {
         organic: usize,
         totals: &mut CampaignDaily,
     ) {
+        if let (
+            Some(masks),
+            CampaignDaily::Dense {
+                first,
+                days,
+                values,
+            },
+        ) = (&mut self.masks, &mut *totals)
+        {
+            masks.run(&self.sessions, clicks, organic, *first, *days, values);
+            return;
+        }
         if let (
             Some(sweep),
             CampaignDaily::Dense {
@@ -618,6 +646,7 @@ mod tests {
             (state >> 32) % limit
         };
         let mut merged = merged::Sweep::new(9);
+        let mut masks = masks::Attribution::default();
         for round in 0..120 {
             let mut sessions: Vec<_> = (0..sample(70) + 1)
                 .map(|_| {
@@ -684,6 +713,10 @@ mod tests {
             assert_eq!(actual, expected, "round {round}");
             let mut dense = vec![CampaignStats::default(); 30 * 9];
             merged.run(&sessions, &clicks, 8, 0, 30, &mut dense);
+            let mut unsorted = vec![CampaignStats::default(); 30 * 9];
+            clicks.reverse();
+            masks.run(&sessions, &clicks, 8, 0, 30, &mut unsorted);
+            assert_eq!(dense, unsorted, "round {round}");
             for c in 0..9 {
                 for day in 0..30 {
                     assert_eq!(

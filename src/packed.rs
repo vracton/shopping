@@ -305,6 +305,9 @@ struct Click {
 }
 
 impl TimedClick for Click {
+    fn smaller_id(&self, other: &Self) -> bool {
+        self.id < other.id
+    }
     fn timestamp(&self) -> i64 {
         i64::from(self.ts)
     }
@@ -699,6 +702,9 @@ struct TimelineClick {
 }
 
 impl TimedClick for TimelineClick {
+    fn smaller_id(&self, other: &Self) -> bool {
+        self.id < other.id
+    }
     fn timestamp(&self) -> i64 {
         i64::from(self.ts)
     }
@@ -948,7 +954,9 @@ impl CountedTimelines {
             let click_end = self.click_cursor[ordinal];
             let events = &mut self.ordered_events[event_start..event_end];
             let clicks = &mut self.ordered_clicks[click_start..click_end];
-            clicks.sort_unstable_by_key(|click| (click.ts, click.id));
+            if self.scratch.needs_click_order() {
+                clicks.sort_unstable_by_key(|click| (click.ts, click.id));
+            }
             if self.bin_min > 0 && events.len() >= self.bin_min {
                 self.scratch.aggregate_binned(
                     UserId::Packed(name),
@@ -1234,6 +1242,7 @@ impl Parsed {
                         scratch: if matches!(daily.campaigns, CampaignDaily::Dense { .. }) {
                             match std::env::var("SHOPPING_ASSISTS").as_deref() {
                                 Ok("merged") => Person::with_merged_sweep(organic + 1),
+                                Ok("masks") => Person::with_click_masks(),
                                 Ok("sweep") => Person::with_assist_sweep(organic + 1),
                                 _ => Person::default(),
                             }
