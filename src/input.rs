@@ -536,41 +536,30 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
                     let boundaries = commas | (1 << end);
                     let starts = (commas << 1) | 1;
                     let ends = boundaries >> 1;
-                    if quotes & !(starts | ends) != 0 {
+                    if quotes & !(starts ^ ends) != 0 {
+                        continue;
+                    }
+                    // Compare opening and closing flags in field order.
+                    let opened = extract_bits(quotes, starts);
+                    if opened != extract_bits(quotes << 1, boundaries) {
                         continue;
                     }
                     let mut start = 0;
-                    let mut output = [&[][..]; N];
-                    let mut valid = true;
-                    for (index, field) in output.iter_mut().enumerate() {
-                        let end = if index + 1 == N {
+                    return Some(std::array::from_fn(|i| {
+                        let stop = if i + 1 == N {
                             end
                         } else {
-                            let place = commas.trailing_zeros() as usize;
+                            let stop = commas.trailing_zeros() as usize;
                             commas &= commas - 1;
-                            place
+                            stop
                         };
-                        let raw = &bytes[start..end];
-                        if !raw.is_empty() && raw[0] == b'"' {
-                            if raw.len() < 2 || raw[raw.len() - 1] != b'"' {
-                                valid = false;
-                                break;
-                            }
-                            // An adjacent delimiter can make an interior position
-                            // eligible in other fields, so keep validation local here.
-                            *field = &raw[1..raw.len() - 1];
-                        } else if raw.last() == Some(&b'"') {
-                            valid = false;
-                            break;
-                        } else {
-                            *field = raw;
-                        }
-                        start = end + 1;
-                    }
-                    if valid {
-                        return Some(output);
-                    }
-                    continue;
+                        let trim = ((opened >> i) & 1) as usize;
+                        // The mask gave N increasing boundaries before the
+                        // newline. A quoted field has two distinct quote bytes.
+                        let field = unsafe { bytes.get_unchecked(start + trim..stop - trim) };
+                        start = stop + 1;
+                        field
+                    }));
                 }
             }
             let row = if let Some(end) = memchr(b'\n', bytes) {
@@ -584,6 +573,29 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
             }
         }
         None
+    }
+}
+
+#[inline(always)]
+fn extract_bits(word: u128, mask: u128) -> u128 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        use std::arch::x86_64::_pext_u64;
+        let low = mask as u64;
+        u128::from(_pext_u64(word as u64, low))
+            | (u128::from(_pext_u64((word >> 64) as u64, (mask >> 64) as u64)) << low.count_ones())
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut mask = mask;
+        let mut result = 0;
+        let mut target = 1;
+        while mask != 0 {
+            result |= u128::from(word & (mask & mask.wrapping_neg()) != 0) * target;
+            mask &= mask - 1;
+            target <<= 1;
+        }
+        result
     }
 }
 
@@ -713,6 +725,45 @@ mod tests {
             assert_eq!(
                 RowWindows::<4>::new(&bytes).collect::<Vec<_>>(),
                 rows(&bytes).filter_map(fields::<4>).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn scanners_match_scalar_across_quote_and_vector_boundaries() {
+        let mut data = Vec::new();
+        let mut state = 7_u64;
+        for pass in 0..3 {
+            data.clear();
+            for row in 0..6000 {
+                for col in 0..7 {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let quote = state >> 63 != 0;
+                    let len = (state >> 32) as usize % 17;
+                    if quote {
+                        data.push(b'"');
+                    }
+                    data.extend(std::iter::repeat_n(b'A' + col, len));
+                    if pass == 1 && row % 143 == 19 && col == 2 {
+                        data.push(b'"');
+                    }
+                    if quote {
+                        data.push(b'"');
+                    }
+                    if col != 6 {
+                        data.push(b',');
+                    }
+                }
+                if pass == 2 && row % 7 == 0 {
+                    data.extend_from_slice(b",unexpected");
+                }
+                data.push(b'\n');
+            }
+            data.extend(std::iter::repeat_n(b'x', 2200));
+            data.extend_from_slice(b",b,c,d,e,f,\"\"\nlast,b,c,d,e,f,g".as_slice());
+            assert_eq!(
+                RowWindows::<7>::new(&data).collect::<Vec<_>>(),
+                rows(&data).filter_map(fields::<7>).collect::<Vec<_>>()
             );
         }
     }
