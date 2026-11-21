@@ -67,6 +67,45 @@ impl Key {
         }
     }
 
+    #[inline(always)]
+    fn pair9(a: &[u8], b: &[u8]) -> Option<(Self, Self)> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "bmi2",
+            target_feature = "sse4.1"
+        ))]
+        {
+            use std::arch::x86_64::*;
+            let a: &[u8; 9] = a.try_into().ok()?;
+            let b: &[u8; 9] = b.try_into().ok()?;
+            unsafe {
+                let x = _mm_loadl_epi64(a.as_ptr().cast());
+                let y = _mm_loadl_epi64(b.as_ptr().cast());
+                let low = _mm_min_epi8(x, y);
+                if _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_set1_epi8(1), low)) & 255 != 0
+                    || a[8].wrapping_sub(1) >= 127
+                    || b[8].wrapping_sub(1) >= 127
+                {
+                    return None;
+                }
+                let pack = |x, tail: u8| {
+                    let word = (_mm_cvtsi128_si64(x) as u64).swap_bytes();
+                    Self((_pext_u64(word, 0x7f7f_7f7f_7f7f_7f7f) << 7) | u64::from(tail))
+                };
+                Some((pack(x, a[8]), pack(y, b[8])))
+            }
+        }
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            target_feature = "bmi2",
+            target_feature = "sse4.1"
+        )))]
+        {
+            let _ = (a, b);
+            None
+        }
+    }
+
     pub fn decode(self, buffer: &mut [u8; 9]) -> &str {
         let mut len = 0;
         for (index, byte) in buffer.iter_mut().enumerate() {
@@ -340,7 +379,11 @@ impl Parser<'_, '_> {
         if id.is_empty() {
             return Some(None);
         }
-        let event = Key::pack(id)?;
+        let pair = Key::pair9(id, user);
+        let event = match pair {
+            Some((event, _)) => event,
+            None => Key::pack(id)?,
+        };
         let code = if self.fast_time.is_some() {
             FastTime::ingest(ingest)
         } else {
@@ -386,7 +429,10 @@ impl Parser<'_, '_> {
             }
             _ => return Some(Some(candidate)),
         };
-        candidate.user = Key::pack(user)?;
+        candidate.user = match pair {
+            Some((_, user)) => user,
+            None => Key::pack(user)?,
+        };
         candidate.ts = relative;
         Some(Some(candidate))
     }
@@ -405,9 +451,13 @@ impl Parser<'_, '_> {
         let Some(campaign) = self.catalog.campaign(campaign) else {
             return Some(None);
         };
+        let (id, user) = match Key::pair9(id, user) {
+            Some(keys) => keys,
+            None => (Key::pack(id)?, Key::pack(user)?),
+        };
         Some(Some(Click {
-            user: Key::pack(user)?,
-            id: Key::pack(id)?,
+            user,
+            id,
             ts: (ts - self.base) as u32,
             campaign: campaign as u32,
         }))
@@ -1081,6 +1131,14 @@ pub fn parse_inputs(
     };
     let window_rows =
         indexed && std::env::var_os("SHOPPING_SCANNER").is_none_or(|mode| mode != "block");
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi2"
+    ))]
+    if window_rows {
+        crate::input::split_fields::observe(events);
+    }
     let decode_clicks = || {
         Stages::span(profile, "click_decode", || {
             clicks

@@ -58,7 +58,25 @@ impl Cells {
         base: i64,
         output: &mut Daily<'a>,
     ) {
+        if events.is_empty() {
+            self.build::<false>(sessions, user, plain, events, base, output)
+        } else {
+            self.build::<true>(sessions, user, plain, events, base, output)
+        }
+    }
+
+    fn build<'a, const PURCHASES: bool>(
+        &mut self,
+        sessions: &mut Vec<Session>,
+        user: UserId<'a>,
+        plain: &[u32],
+        events: &[impl TimedEvent],
+        base: i64,
+        output: &mut Daily<'a>,
+    ) {
         let mut occupied = 0u64;
+        debug_assert!(PURCHASES || events.is_empty());
+        let events = if PURCHASES { events } else { &[] };
         let times = plain
             .iter()
             .copied()
@@ -91,7 +109,9 @@ impl Cells {
                     let session_day = day(base + start);
                     if current_day != session_day {
                         current_day = session_day;
-                        row_indices[(session_day - base_day) as usize] = output.users.len();
+                        if PURCHASES {
+                            row_indices[(session_day - base_day) as usize] = output.users.len();
+                        }
                         output.users.push(new_user_day(user, session_day));
                     }
                     sessions.push(Session {
@@ -104,8 +124,13 @@ impl Cells {
                 output.users.last_mut().unwrap().events += cell.count as i64;
                 previous_end = i64::from(cell.last);
                 *cell = Cell::EMPTY;
-                self.owners[index] = sessions.len() - 1;
+                if PURCHASES {
+                    self.owners[index] = sessions.len() - 1;
+                }
             }
+        }
+        if !PURCHASES {
+            return;
         }
         for event in events {
             let (price, category) = event.purchase();
