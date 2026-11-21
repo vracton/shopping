@@ -18,6 +18,9 @@ mod split;
 #[path = "packed_claims.rs"]
 mod claims;
 
+#[path = "packed_tokens.rs"]
+mod tokens;
+
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
 
@@ -716,13 +719,13 @@ impl TimedEvent for TimelineEvent {
 
 type BucketPair = (Vec<Vec<Event>>, Vec<Vec<Click>>);
 
-struct Job {
-    buckets: Vec<BucketPair>,
+struct Job<T> {
+    buckets: Vec<T>,
     weight: usize,
 }
 
-fn coalesce(events: Vec<Vec<Vec<Event>>>, clicks: Vec<Vec<Vec<Click>>>) -> Vec<Job> {
-    let mut buckets: Vec<_> = events
+fn coalesce(events: Vec<Vec<Vec<Event>>>, clicks: Vec<Vec<Vec<Click>>>) -> Vec<Job<BucketPair>> {
+    let buckets: Vec<_> = events
         .into_iter()
         .zip(clicks)
         .filter_map(|(events, clicks)| {
@@ -731,6 +734,10 @@ fn coalesce(events: Vec<Vec<Vec<Event>>>, clicks: Vec<Vec<Vec<Click>>>) -> Vec<J
             (event_rows != 0).then_some((event_rows + click_rows, (events, clicks)))
         })
         .collect();
+    balance(buckets)
+}
+
+fn balance<T>(mut buckets: Vec<(usize, T)>) -> Vec<Job<T>> {
     buckets.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
     let mut jobs: Vec<_> = (0..rayon::current_num_threads().min(buckets.len()))
         .map(|_| Job {
@@ -942,23 +949,37 @@ impl CountedTimelines {
             let click_end = self.click_cursor[ordinal];
             let events = &mut self.ordered_events[event_start..event_end];
             let clicks = &mut self.ordered_clicks[click_start..click_end];
-            clicks.sort_unstable_by_key(|click| (click.ts, click.id));
-            if self.bin_min > 0 && events.len() >= self.bin_min {
-                self.scratch.aggregate_binned(
-                    UserId::Packed(name),
-                    events,
-                    clicks,
-                    organic,
-                    base,
-                    out,
-                );
-            } else {
-                events.sort_unstable_by_key(|event| event.0);
-                self.scratch
-                    .aggregate(UserId::Packed(name), events, clicks, organic, base, out);
-            }
+            finish_timeline(
+                &mut self.scratch,
+                self.bin_min,
+                name,
+                events,
+                clicks,
+                organic,
+                base,
+                out,
+            );
             (event_start, click_start) = (event_end, click_end);
         }
+    }
+}
+
+fn finish_timeline(
+    scratch: &mut Person,
+    bin_min: usize,
+    name: Key,
+    events: &mut [TimelineEvent],
+    clicks: &mut [TimelineClick],
+    organic: usize,
+    base: i64,
+    out: &mut Daily<'static>,
+) {
+    clicks.sort_unstable_by_key(|click| (click.ts, click.id));
+    if bin_min > 0 && events.len() >= bin_min {
+        scratch.aggregate_binned(UserId::Packed(name), events, clicks, organic, base, out);
+    } else {
+        events.sort_unstable_by_key(|event| event.0);
+        scratch.aggregate(UserId::Packed(name), events, clicks, organic, base, out);
     }
 }
 
@@ -993,6 +1014,7 @@ pub struct Parsed {
     events: EventInput,
     clicks: Vec<Vec<Click>>,
     links: Aliases,
+    tokens: Option<tokens::Directory>,
     base: i64,
     first_day: i32,
     days: usize,
@@ -1079,14 +1101,22 @@ pub fn parse_inputs(
                 && std::env::var_os("SHOPPING_LINKS").as_deref()
                     == Some(std::ffi::OsStr::new("sparse"))
             {
-                sparse_links::Sparse::new(link_chunks).map(Aliases::Sparse)
+                let links = sparse_links::Sparse::new(link_chunks)?;
+                let directory =
+                    if std::env::var_os("SHOPPING_TIMELINES").is_some_and(|x| x == "tokens") {
+                        let bytes: usize = events.iter().map(|s| s.len()).sum();
+                        tokens::Directory::new(&links, bytes, count)
+                    } else {
+                        None
+                    };
+                Some((Aliases::Sparse(links), directory))
             } else if indexed
                 && std::env::var_os("SHOPPING_LINKS").as_deref()
                     == Some(std::ffi::OsStr::new("parallel"))
             {
-                Aliases::parallel(link_chunks)
+                Aliases::parallel(link_chunks).map(|links| (links, None))
             } else {
-                Links::new(link_files.iter().copied()).map(Aliases::Serial)
+                Links::new(link_files.iter().copied()).map(|links| (Aliases::Serial(links), None))
             }
         })
     };
@@ -1094,11 +1124,11 @@ pub fn parse_inputs(
         && std::env::var_os("SHOPPING_ROUTE").as_deref() == Some(std::ffi::OsStr::new("split"));
     let (events, clicks, links) = if split_route {
         let (links, clicks) = rayon::join(decode_links, decode_clicks);
-        let links = links?;
+        let (links, directory) = links?;
         let events = Stages::span(profile, "split_decode", || {
             split::decode(events, &parser, &links, count, dedup_count, window_rows)
         })?;
-        (EventInput::ByPerson(events), clicks?, links)
+        (EventInput::ByPerson(events), clicks?, (links, directory))
     } else {
         let ((events, clicks), links) = rayon::join(
             || {
@@ -1134,7 +1164,9 @@ pub fn parse_inputs(
         );
         (events?, clicks?, links?)
     };
+    let (links, tokens) = links;
     Some(Parsed {
+        tokens,
         events,
         clicks,
         links,
@@ -1159,7 +1191,13 @@ impl Parsed {
             base,
             first_day,
             days,
+            tokens,
         } = self;
+        if let Some(directory) = tokens
+            && let EventInput::Claims(batch) = events
+        {
+            return directory.aggregate(batch, clicks, base, first_day, days, organic, stages);
+        }
         let choose = if !indexed {
             dedup
         } else if std::env::var_os("SHOPPING_DEDUP_MODE").as_deref()

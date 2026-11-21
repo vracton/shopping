@@ -1,0 +1,382 @@
+//! Assign canonical identities during routing. A view or cart then crosses the
+//! thread boundary in eight bytes, and the grouping worker can count by slot.
+use super::*;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+const REDIRECT: u64 = 1 << 63;
+const PROBES: usize = 96;
+
+pub(super) struct Directory {
+    keys: Vec<AtomicU64>,
+    roots: Vec<u32>,
+    shift: u32,
+    parts: usize,
+}
+
+impl Directory {
+    pub(super) fn new(links: &sparse_links::Sparse, bytes: usize, parts: usize) -> Option<Self> {
+        // Size is only a space/time heuristic. Every identity that cannot get
+        // a slot takes the full-key path. Cap this auxiliary table at 96 MiB.
+        let size = (bytes / 768)
+            .max(parts)
+            .max(64)
+            .checked_next_power_of_two()?
+            .min(1 << 23);
+        if parts > size {
+            return None;
+        }
+        let mut table = Self {
+            keys: (0..size).map(|_| AtomicU64::new(0)).collect(),
+            roots: vec![0; size],
+            shift: (size / parts).trailing_zeros(),
+            parts,
+        };
+        for (name, root) in links.aliases() {
+            let root_slot = table.intern(root)?;
+            let alias_slot = table.intern(name)?;
+            *table.keys[alias_slot].get_mut() = name.0 | REDIRECT;
+            table.roots[alias_slot] = root_slot as u32;
+        }
+        Some(table)
+    }
+
+    #[inline(always)]
+    fn intern(&self, key: Key) -> Option<usize> {
+        let mask = self.keys.len() - 1;
+        let mut index = key.hash() as usize & mask;
+        for _ in 0..PROBES {
+            let cell = &self.keys[index];
+            let mut tag = cell.load(Relaxed);
+            if tag == 0 {
+                match cell.compare_exchange(0, key.0, Relaxed, Relaxed) {
+                    Ok(_) => return Some(index),
+                    Err(stored) => tag = stored,
+                }
+            }
+            if tag == key.0 {
+                return Some(index);
+            }
+            if tag == key.0 | REDIRECT {
+                return Some(self.roots[index] as usize);
+            }
+            index = (index + 1) & mask;
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, key: Key) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let index = key.hash() as usize & (self.keys.len() - 1);
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                    self.keys.as_ptr().add(index).cast(),
+                )
+            }
+        }
+    }
+
+    fn aggregate_events(&self, batch: claims::ClaimBatch) -> Vec<Vec<Events>> {
+        let mask = (1 << self.shift) - 1;
+        batch
+            .winners()
+            .into_par_iter()
+            .map(|rows| {
+                let mut parts: Vec<_> = (0..self.parts)
+                    .map(|_| Events {
+                        plain: Vec::with_capacity(rows.len() / self.parts),
+                        ..Events::default()
+                    })
+                    .collect();
+                for block in rows.chunks(32) {
+                    for row in block {
+                        self.prefetch(row.user);
+                    }
+                    for row in block {
+                        let ts = row.ts.load(Relaxed);
+                        if ts == INVALID {
+                            continue;
+                        }
+                        if let Some(slot) = self.intern(row.user) {
+                            let part = &mut parts[slot >> self.shift];
+                            let local = (slot & mask) as u32;
+                            if row.purchase == 0 {
+                                part.plain.push([local, ts]);
+                            } else {
+                                part.purchases.push([local, ts, row.purchase]);
+                            }
+                        } else {
+                            let part = bucket(row.user, self.parts);
+                            parts[part].spill.push(Event {
+                                user: row.user,
+                                ts,
+                                purchase: row.purchase,
+                            });
+                        }
+                    }
+                }
+                parts
+            })
+            .collect()
+    }
+
+    fn route_clicks(&self, clicks: Vec<Vec<Click>>) -> Vec<Vec<Clicks>> {
+        let mask = (1 << self.shift) - 1;
+        clicks
+            .into_par_iter()
+            .map(|rows| {
+                let mut parts: Vec<_> = (0..self.parts).map(|_| Clicks::default()).collect();
+                for block in rows.chunks(32) {
+                    for row in block {
+                        self.prefetch(row.user);
+                    }
+                    for row in block {
+                        if let Some(slot) = self.intern(row.user) {
+                            parts[slot >> self.shift].hits.push((
+                                (slot & mask) as u32,
+                                TimelineClick {
+                                    id: row.id,
+                                    ts: row.ts,
+                                    campaign: row.campaign,
+                                },
+                            ));
+                        } else {
+                            parts[bucket(row.user, self.parts)]
+                                .spill
+                                .push(Click { ..*row });
+                        }
+                    }
+                }
+                parts
+            })
+            .collect()
+    }
+
+    pub(super) fn aggregate(
+        self,
+        batch: claims::ClaimBatch,
+        clicks: Vec<Vec<Click>>,
+        base: i64,
+        first_day: i32,
+        days: usize,
+        organic: usize,
+        stages: &mut Stages,
+    ) -> Vec<Daily<'static>> {
+        let (events, clicks) = rayon::join(
+            || self.aggregate_events(batch),
+            || self.route_clicks(clicks),
+        );
+        let mut parts: Vec<_> = (0..self.parts)
+            .map(|index| Part {
+                index,
+                ..Part::default()
+            })
+            .collect();
+        for group in events {
+            for (part, events) in parts.iter_mut().zip(group) {
+                if events.len() > 0 {
+                    part.weight += events.len();
+                    part.events.push(events);
+                }
+            }
+        }
+        for group in clicks {
+            for (part, clicks) in parts.iter_mut().zip(group) {
+                if !clicks.hits.is_empty() || !clicks.spill.is_empty() {
+                    part.weight += clicks.hits.len() + clicks.spill.len();
+                    part.clicks.push(clicks);
+                }
+            }
+        }
+        let parts = parts
+            .into_iter()
+            .filter(|p| !p.events.is_empty())
+            .map(|p| (p.weight, p))
+            .collect();
+        let jobs = balance(parts);
+        stages.mark("packed_dedup_and_partition");
+        jobs.into_par_iter()
+            .map(|job| {
+                let mut daily = Daily {
+                    users: Vec::new(),
+                    campaigns: CampaignDaily::dense(first_day, days, organic + 1),
+                };
+                let mut counted = CountedTimelines {
+                    scratch: if matches!(daily.campaigns, CampaignDaily::Dense { .. })
+                        && std::env::var_os("SHOPPING_ASSISTS").is_some_and(|s| s == "sweep")
+                    {
+                        Person::with_assist_sweep(organic + 1)
+                    } else {
+                        Person::default()
+                    },
+                    bin_min: std::env::var("SHOPPING_BIN_MIN")
+                        .ok()
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(64),
+                    ..CountedTimelines::default()
+                };
+                let mut cursors = Vec::new();
+                for part in job.buckets {
+                    let span = 1 << self.shift;
+                    let keys = &self.keys[part.index * span..(part.index + 1) * span];
+                    part.finish(keys, &mut cursors, &mut counted, organic, base, &mut daily);
+                }
+                daily
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct Events {
+    plain: Vec<[u32; 2]>,
+    purchases: Vec<[u32; 3]>,
+    spill: Vec<Event>,
+}
+
+impl Events {
+    fn len(&self) -> usize {
+        self.plain.len() + self.purchases.len() + self.spill.len()
+    }
+}
+
+#[derive(Default)]
+struct Clicks {
+    hits: Vec<(u32, TimelineClick)>,
+    spill: Vec<Click>,
+}
+
+#[derive(Default)]
+struct Part {
+    index: usize,
+    weight: usize,
+    events: Vec<Events>,
+    clicks: Vec<Clicks>,
+}
+
+impl Part {
+    fn finish(
+        self,
+        keys: &[AtomicU64],
+        cursors: &mut Vec<(usize, usize)>,
+        counted: &mut CountedTimelines,
+        organic: usize,
+        base: i64,
+        out: &mut Daily<'static>,
+    ) {
+        cursors.clear();
+        cursors.resize(keys.len(), (0, 0));
+        for group in &self.events {
+            for &[slot, _] in &group.plain {
+                cursors[slot as usize].0 += 1;
+            }
+            for &[slot, _, _] in &group.purchases {
+                cursors[slot as usize].0 += 1;
+            }
+        }
+        for group in &self.clicks {
+            for &(slot, _) in &group.hits {
+                cursors[slot as usize].1 += 1;
+            }
+        }
+        let (mut events, mut clicks) = (0, 0);
+        for cursor in &mut *cursors {
+            let (ne, nc) = *cursor;
+            *cursor = (events, clicks);
+            events += ne;
+            clicks += nc;
+        }
+        counted.ordered_events.resize(events, TimelineEvent(0));
+        counted.ordered_clicks.resize(
+            clicks,
+            TimelineClick {
+                ts: 0,
+                campaign: 0,
+                id: Key(0),
+            },
+        );
+        let mut spill_events = Vec::new();
+        for group in self.events {
+            for [slot, ts] in group.plain {
+                let position = &mut cursors[slot as usize].0;
+                counted.ordered_events[*position] = TimelineEvent(u64::from(ts) << 32);
+                *position += 1;
+            }
+            for [slot, ts, purchase] in group.purchases {
+                let position = &mut cursors[slot as usize].0;
+                counted.ordered_events[*position] =
+                    TimelineEvent(u64::from(ts) << 32 | u64::from(purchase));
+                *position += 1;
+            }
+            if !group.spill.is_empty() {
+                spill_events.push(group.spill)
+            }
+        }
+        let mut spill_clicks = Vec::new();
+        for group in self.clicks {
+            for (slot, hit) in group.hits {
+                let position = &mut cursors[slot as usize].1;
+                counted.ordered_clicks[*position] = hit;
+                *position += 1;
+            }
+            if !group.spill.is_empty() {
+                spill_clicks.push(group.spill)
+            }
+        }
+        let (mut e, mut c) = (0, 0);
+        for (slot, &(end_e, end_c)) in cursors.iter().enumerate() {
+            if end_e != e {
+                finish_timeline(
+                    &mut counted.scratch,
+                    counted.bin_min,
+                    Key(keys[slot].load(Relaxed)),
+                    &mut counted.ordered_events[e..end_e],
+                    &mut counted.ordered_clicks[c..end_c],
+                    organic,
+                    base,
+                    out,
+                );
+            }
+            (e, c) = (end_e, end_c);
+        }
+        if !spill_events.is_empty() {
+            counted.run((spill_events, spill_clicks), organic, base, out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirects_and_colliding_singletons_remain_distinct_across_workers() {
+        let links = sparse_links::Sparse::new(&[b"c,b\nb,a\nd,c\na,b\n"]).unwrap();
+        let table = Directory::new(&links, 1, 4).unwrap();
+        let key = |s: &[u8]| Key::pack(s).unwrap();
+        let canonical = table.intern(key(b"a")).unwrap();
+        for name in [b"a", b"b", b"c", b"d"] {
+            assert_eq!(table.intern(key(name)), Some(canonical));
+        }
+        assert_eq!(table.keys[canonical].load(Relaxed), key(b"a").0);
+
+        let names: Vec<_> = (1..100000)
+            .map(Key)
+            .filter(|k| k.hash() as usize % table.keys.len() == 0)
+            .take(130)
+            .collect();
+        let parallel: Vec<_> = names.par_iter().map(|&k| table.intern(k)).collect();
+        let mut spills = 0;
+        for (name, slot) in names.into_iter().zip(parallel) {
+            assert_eq!(table.intern(name), slot);
+            if let Some(slot) = slot {
+                assert_eq!(table.keys[slot].load(Relaxed), name.0);
+            } else {
+                spills += 1;
+            }
+        }
+        assert!(spills > 0);
+        assert_eq!(table.intern(key(b"d")), Some(canonical));
+    }
+}

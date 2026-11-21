@@ -2,10 +2,10 @@
 //! Only potential duplicates read the full ID and ingest timestamp.
 use super::*;
 
-struct MarkedEvent {
-    user: Key,
-    ts: std::sync::atomic::AtomicU32,
-    purchase: u32,
+pub(super) struct MarkedEvent {
+    pub(super) user: Key,
+    pub(super) ts: std::sync::atomic::AtomicU32,
+    pub(super) purchase: u32,
 }
 
 pub(super) struct ClaimBatch {
@@ -89,7 +89,7 @@ impl ClaimBatch {
         })
     }
 
-    pub(super) fn route(self, links: &Aliases, count: usize) -> Vec<Vec<Vec<Event>>> {
+    pub(super) fn winners(self) -> Vec<Vec<MarkedEvent>> {
         use std::sync::atomic::Ordering::Relaxed;
         let Self {
             metadata,
@@ -174,8 +174,12 @@ impl ClaimBatch {
                 }
             }
         });
-        drop(metadata);
-        let parts = events
+        events
+    }
+
+    pub(super) fn route(self, links: &Aliases, count: usize) -> Vec<Vec<Vec<Event>>> {
+        let parts = self
+            .winners()
             .into_par_iter()
             .map(|rows| {
                 let mut output: Vec<_> = (0..count)

@@ -5,6 +5,10 @@ use super::{Key, RowWindows};
 pub(super) struct Sparse(Vec<(Key, Key)>);
 
 impl Sparse {
+    pub(super) fn aliases(&self) -> impl Iterator<Item = (Key, Key)> + '_ {
+        self.0.iter().copied().filter(|entry| entry.0.0 != 0)
+    }
+
     #[inline]
     pub(super) fn prefetch(&self, key: Key) {
         #[cfg(target_arch = "x86_64")]
