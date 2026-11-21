@@ -88,7 +88,7 @@ def scan(files, workers):
     return perf_counter() - start, read_bytes
 
 
-def run_pipeline(args, command, workers):
+def run_pipeline(args, command, workers, overrides=None):
     with TemporaryDirectory(prefix="shopping-bench-", dir=args.work_dir) as directory:
         output = Path(directory) / "output"
         scratch = Path(directory) / "scratch"
@@ -96,6 +96,7 @@ def run_pipeline(args, command, workers):
         scratch.mkdir()
         env = dict(os.environ, DATA_DIR=str(args.data), OUTPUT_DIR=str(output),
                    SCRATCH_DIR=str(scratch), HOME=str(scratch), NCPU=str(workers), MEM_GB="24")
+        env.update(overrides or {})
         start = perf_counter()
         subprocess.run(command, env=env, check=True)
         elapsed = perf_counter() - start
