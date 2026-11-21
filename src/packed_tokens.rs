@@ -35,30 +35,26 @@ impl Directory {
         // A child is linked only to a current root. Reversing the joins
         // therefore makes every parent's final slot available before its children.
         let mut joined = Vec::new();
+        // Decode a block of edges before chasing either endpoint. Most table
+        // reads miss cache when following independent links one row at a time.
+        let mut pending = Vec::with_capacity(64);
         for chunk in chunks {
             for [left, right] in RowWindows::<2>::new(chunk) {
                 if left.is_empty() || right.is_empty() {
                     continue;
                 }
                 let (a, b) = (Key::pack(left)?, Key::pack(right)?);
-                if a == b {
-                    continue;
-                }
-                let a = table.insert(a)?;
-                let b = table.insert(b)?;
-                let a = table.root(a);
-                let b = table.root(b);
                 if a != b {
-                    let (child, parent) = if *table.keys[a].get_mut() > *table.keys[b].get_mut() {
-                        (a, b)
-                    } else {
-                        (b, a)
-                    };
-                    table.roots[child] = parent as u32 + 1;
-                    joined.push(child);
+                    table.prefetch(a);
+                    table.prefetch(b);
+                    pending.push((a, b));
+                    if pending.len() == 64 {
+                        table.join_edges(&mut pending, &mut joined)?;
+                    }
                 }
             }
         }
+        table.join_edges(&mut pending, &mut joined)?;
         for child in joined.into_iter().rev() {
             let parent = table.roots[child] as usize - 1;
             let root = if *table.keys[parent].get_mut() & REDIRECT != 0 {
@@ -70,6 +66,25 @@ impl Directory {
             table.roots[child] = root;
         }
         Some(table)
+    }
+
+    fn join_edges(&mut self, pending: &mut Vec<(Key, Key)>, joined: &mut Vec<usize>) -> Option<()> {
+        for (a, b) in pending.drain(..) {
+            let a = self.insert(a)?;
+            let b = self.insert(b)?;
+            let a = self.root(a);
+            let b = self.root(b);
+            if a != b {
+                let (child, parent) = if *self.keys[a].get_mut() > *self.keys[b].get_mut() {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                self.roots[child] = parent as u32 + 1;
+                joined.push(child);
+            }
+        }
+        Some(())
     }
 
     fn insert(&mut self, key: Key) -> Option<usize> {
