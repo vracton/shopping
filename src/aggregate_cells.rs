@@ -1,34 +1,48 @@
-//! For packed u32 timestamps, at most 38 bitmap words cover the full range.
+//! For packed u32 timestamps, 64 bitmap words cover the full range.
 //! An occupied cell represents a single connected run. Its earliest and latest
 //! timestamps decide exactly whether it connects to the next occupied cell.
 use super::*;
 
-const CELLS: usize = u32::MAX as usize / BIN_MS + 1;
+// The gap spans more than one cell. Every pair inside a cell is
+// connected, and the exact extrema still decide every cross-cell gap.
+const SHIFT: u32 = 20;
+const CELLS: usize = (u32::MAX >> SHIFT) as usize + 1;
+const _: () = assert!((1 << SHIFT) - 1 <= SESSION_GAP_MS);
 const WORDS: usize = CELLS.div_ceil(64);
 const DAYS: usize = u32::MAX as usize / DAY_MS as usize + 2;
 const CATEGORIES: usize = 256;
 const _: () = assert!(WORDS <= 64);
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Cell {
     first: u32,
     last: u32,
     count: usize,
 }
 
+impl Cell {
+    const EMPTY: Self = Self {
+        first: u32::MAX,
+        last: 0,
+        count: 0,
+    };
+}
+
 pub(super) struct Cells {
     slots: Vec<Cell>,
     occupancy: [u64; WORDS],
-    purchases: Vec<(usize, usize, u32)>,
+    owners: Vec<usize>,
+    touched_categories: Vec<usize>,
     by_category: Vec<i64>,
 }
 
 impl Default for Cells {
     fn default() -> Self {
         Self {
-            slots: vec![Cell::default(); CELLS],
+            slots: vec![Cell::EMPTY; CELLS],
             occupancy: [0; WORDS],
-            purchases: Vec::new(),
+            owners: vec![0; CELLS],
+            touched_categories: Vec::new(),
             by_category: vec![0; DAYS * CATEGORIES],
         }
     }
@@ -45,27 +59,18 @@ impl Cells {
         output: &mut Daily<'a>,
     ) {
         let mut occupied = 0u64;
-        self.purchases.clear();
-        let times = plain.iter().map(|&ts| (ts, (0, 0)));
-        let other = events
+        let times = plain
             .iter()
-            .map(|event| (event.timestamp() as u32, event.purchase()));
-        for (ts, (price, category)) in times.chain(other) {
-            let index = ts as usize / BIN_MS;
+            .copied()
+            .chain(events.iter().map(|e| e.timestamp() as u32));
+        for ts in times {
+            let index = (ts >> SHIFT) as usize;
             let cell = &mut self.slots[index];
-            if cell.count == 0 {
-                cell.first = ts;
-                cell.last = ts;
-                self.occupancy[index >> 6] |= 1 << (index & 63);
-                occupied |= 1 << (index >> 6);
-            } else {
-                cell.first = cell.first.min(ts);
-                cell.last = cell.last.max(ts);
-            }
+            cell.first = cell.first.min(ts);
+            cell.last = cell.last.max(ts);
             cell.count += 1;
-            if price != 0 {
-                self.purchases.push((index, category as usize, price));
-            }
+            self.occupancy[index >> 6] |= 1 << (index & 63);
+            occupied |= 1 << (index >> 6);
         }
 
         sessions.clear();
@@ -98,20 +103,27 @@ impl Cells {
                 }
                 output.users.last_mut().unwrap().events += cell.count as i64;
                 previous_end = i64::from(cell.last);
-                cell.count = 0;
-                // The extrema have been consumed. Retain the owning session
-                // for the sparse purchase payloads until the next shopper.
-                cell.first = (sessions.len() - 1) as u32;
+                *cell = Cell::EMPTY;
+                self.owners[index] = sessions.len() - 1;
             }
         }
-        for &(cell, category, price) in &self.purchases {
-            let session = &mut sessions[self.slots[cell].first as usize];
+        for event in events {
+            let (price, category) = event.purchase();
+            if price == 0 {
+                continue;
+            }
+            let category = category as usize;
+            let index = ((event.timestamp() as u32) >> SHIFT) as usize;
+            let session = &mut sessions[self.owners[index]];
             let offset = (session.day - base_day) as usize;
             let row = &mut output.users[row_indices[offset]];
             let price = i64::from(price);
             row.revenue += price;
             session.revenue += price;
             let amounts = &mut self.by_category[offset * CATEGORIES..][..CATEGORIES];
+            if amounts[category] == 0 {
+                self.touched_categories.push(offset * CATEGORIES + category);
+            }
             amounts[category] += price;
             if row.top_category.is_none_or(|prev| {
                 (amounts[category], std::cmp::Reverse(category))
@@ -120,9 +132,55 @@ impl Cells {
                 row.top_category = Some(category as u32);
             }
         }
-        for &(cell, category, _) in &self.purchases {
-            let session = &sessions[self.slots[cell].first as usize];
-            self.by_category[(session.day - base_day) as usize * CATEGORIES + category] = 0;
+        for index in self.touched_categories.drain(..) {
+            self.by_category[index] = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crossing_bitmap_words_and_the_last_bin_preserves_exact_gaps() {
+        let gap = SESSION_GAP_MS as u32;
+        let first = (63 << SHIFT) + 17;
+        let last = u32::MAX - 1;
+        let plain = [last, first + gap, first + 2 * gap + 1, first, last - gap];
+        let purchases = [(first + gap, 10, 7), (last, 11, 3)].map(|(ts, price, category)| Event {
+            ts: i64::from(ts),
+            price,
+            category,
+            user: b"u",
+        });
+        let mut scratch = Cells::default();
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let mut output = Daily::default();
+            scratch.run(
+                &mut sessions,
+                UserId::Bytes(b"u"),
+                &plain,
+                &purchases,
+                0,
+                &mut output,
+            );
+            assert_eq!(
+                sessions
+                    .iter()
+                    .map(|s| (s.start as u32, s.revenue))
+                    .collect::<Vec<_>>(),
+                [(first, 10), (first + 2 * gap + 1, 0), (last - gap, 11)]
+            );
+            assert_eq!(
+                output
+                    .users
+                    .iter()
+                    .map(|row| (row.events, row.top_category))
+                    .collect::<Vec<_>>(),
+                [(4, Some(7)), (3, Some(3))]
+            );
         }
     }
 }
