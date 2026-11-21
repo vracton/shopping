@@ -43,10 +43,7 @@ impl FastTime {
             }
             let prefix = u64::from_le_bytes(date.as_bytes()[..8].try_into().unwrap());
             let day = u16::from_le_bytes(date.as_bytes()[8..10].try_into().unwrap());
-            let mut index = date_slot(prefix, day);
-            while result.atoms[index].prefix != 0 {
-                index = (index + 1) & 127;
-            }
+            let index = date_slot(prefix, day);
             result.atoms[index] = DateAtom {
                 prefix,
                 day,
@@ -57,14 +54,55 @@ impl FastTime {
     }
 
     #[inline(always)]
-    pub fn ingest(bytes: &[u8]) -> Option<u64> {
+    fn midnight(&self, timestamp: &[u8]) -> Option<i64> {
+        let prefix = u64::from_le_bytes(timestamp[..8].try_into().unwrap());
+        let day = u16::from_le_bytes(timestamp[8..10].try_into().unwrap());
+        let atom = self.atoms[date_slot(prefix, day)];
+        (atom.prefix != 0 && atom.prefix == prefix && atom.day == day)
+            .then_some(i64::from(atom.epoch_day) * DAY_MS)
+    }
+
+    /// Event and ingest clocks occupy the two halves of one SIMD register.
+    /// The ingest date stays lexically ordered, including outside the window.
+    #[inline(always)]
+    pub fn event_times(
+        &self,
+        ts: &[u8],
+        ingest: &[u8],
+        calendar: &Calendar,
+    ) -> Option<(u64, Option<i64>)> {
+        let ingest: &[u8; 20] = ingest.try_into().ok()?;
+        let date = ingest_date(ingest);
+        #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+        if matches!(ts.len(), 20 | 25) && ts[4] == b'-' {
+            let (event_clock, ingest_clock) = paired_clocks(
+                ts[11..19].try_into().unwrap(),
+                ingest[11..19].try_into().unwrap(),
+            );
+            let value = if let Some(midnight) = self.midnight(ts) {
+                event_clock.and_then(|seconds| {
+                    Some(midnight + (i64::from(seconds) - utc_offset_seconds(ts)?) * 1000)
+                })
+            } else {
+                calendar.timestamp(ts)
+            };
+            return Some((date | u64::from(ingest_clock), value));
+        }
+        let clock = u64::from_be_bytes(ingest[11..19].try_into().unwrap());
+        Some((
+            date | extract(clock, TIME_NIBBLES),
+            self.timestamp(ts, calendar),
+        ))
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    fn ingest(bytes: &[u8]) -> Option<u64> {
         let bytes: &[u8; 20] = bytes.try_into().ok()?;
         // Ingest is guaranteed to be valid F1. Decimal nibbles preserve its
         // lexical order, so dedup never needs to parse it as epoch time.
-        let front = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-        let day = (u64::from(bytes[8] & 15) << 4) | u64::from(bytes[9] & 15);
         let clock = u64::from_be_bytes(bytes[11..19].try_into().unwrap());
-        Some((extract(front, DAY_NIBBLES) << 32) | (day << 24) | extract(clock, TIME_NIBBLES))
+        Some(ingest_date(bytes) | extract(clock, TIME_NIBBLES))
     }
 
     #[inline(always)]
@@ -89,20 +127,8 @@ impl FastTime {
                 )
             }
             20 if bytes[10] == b'T' && bytes[19] == b'Z' => {
-                let prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                let day = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-                let mut index = date_slot(prefix, day);
-                let epoch_day = loop {
-                    let atom = self.atoms[index];
-                    // An empty slot has an all-zero key, which malformed
-                    // input can supply literally. Test occupancy first.
-                    if atom.prefix == 0 {
-                        return calendar.timestamp(bytes);
-                    }
-                    if atom.prefix == prefix && atom.day == day {
-                        break i64::from(atom.epoch_day);
-                    }
-                    index = (index + 1) & 127;
+                let Some(midnight) = self.midnight(bytes) else {
+                    return calendar.timestamp(bytes);
                 };
                 let clock = u64::from_be_bytes(bytes[11..19].try_into().unwrap());
                 const DIGIT_BYTES: u64 = 0xffff_00ff_ff00_ffff;
@@ -116,11 +142,80 @@ impl FastTime {
                 if hour >= 24 || minute >= 60 || second >= 60 {
                     return None;
                 }
-                Some(epoch_day * DAY_MS + ((hour * 3600 + minute * 60 + second) * 1000) as i64)
+                Some(midnight + ((hour * 3600 + minute * 60 + second) * 1000) as i64)
             }
             _ => calendar.timestamp(bytes),
         }
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+fn utc_offset_seconds(ts: &[u8]) -> Option<i64> {
+    if ts[10] != b'T' {
+        return None;
+    }
+    match (ts.len(), ts[19]) {
+        (20, b'Z') => Some(0),
+        (25, sign @ (b'+' | b'-')) if ts[22] == b':' => {
+            let hours = two_digits(ts[20], ts[21])?;
+            let minutes = two_digits(ts[23], ts[24])?;
+            if hours >= 24 || minutes >= 60 {
+                return None;
+            }
+            let seconds = hours * 3600 + minutes * 60;
+            Some(if sign == b'+' { seconds } else { -seconds })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+fn two_digits(a: u8, b: u8) -> Option<i64> {
+    let a = a.wrapping_sub(b'0');
+    let b = b.wrapping_sub(b'0');
+    (a < 10 && b < 10).then_some(i64::from(a) * 10 + i64::from(b))
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+fn paired_clocks(event: &[u8; 8], ingest: &[u8; 8]) -> (Option<u32>, u32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let both = _mm_unpacklo_epi64(
+            _mm_loadl_epi64(event.as_ptr().cast()),
+            _mm_loadl_epi64(ingest.as_ptr().cast()),
+        );
+        let digits = _mm_sub_epi8(both, _mm_set1_epi64x(i64::from_le_bytes(*b"00:00:00")));
+        let ordered = _mm_shuffle_epi8(
+            digits,
+            _mm_setr_epi8(6, 7, 3, 4, 0, 1, -1, -1, 14, 15, 11, 12, 8, 9, -1, -1),
+        );
+        // Event pairs are binary, ingest pairs are BCD for the dedup order.
+        let pairs = _mm_maddubs_epi16(
+            ordered,
+            _mm_set_epi64x(0x0110011001100110, 0x010a010a010a010a),
+        );
+        let compact = _mm_packus_epi16(pairs, pairs);
+        let code = _mm_cvtsi128_si32(_mm_srli_si128(compact, 4)) as u32;
+        let invalid = _mm_subs_epu8(
+            digits,
+            _mm_set1_epi64x(i64::from_le_bytes([9, 9, 0, 9, 9, 0, 9, 9])),
+        );
+        let range = _mm_subs_epu8(compact, _mm_set_epi32(-1, -1, -1, 0x0017_3b3b));
+        let bad = _mm_cvtsi128_si64(invalid) | i64::from(_mm_cvtsi128_si32(range));
+        let seconds = _mm_madd_epi16(pairs, _mm_setr_epi16(1, 60, 3600, 0, 0, 0, 0, 0));
+        let total = _mm_cvtsi128_si32(_mm_add_epi32(seconds, _mm_srli_si128(seconds, 4))) as u32;
+        ((bad == 0).then_some(total), code)
+    }
+}
+
+#[inline(always)]
+fn ingest_date(bytes: &[u8; 20]) -> u64 {
+    let front = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+    let day = (u64::from(bytes[8] & 15) << 4) | u64::from(bytes[9] & 15);
+    (extract(front, DAY_NIBBLES) << 32) | (day << 24)
 }
 
 fn bcd(mut n: u64, digits: u32) -> u64 {
@@ -134,9 +229,9 @@ fn bcd(mut n: u64, digits: u32) -> u64 {
 
 #[inline(always)]
 fn date_slot(prefix: u64, day: u16) -> usize {
-    ((prefix >> 40).wrapping_mul(241) ^ u64::from(day).wrapping_mul(109) ^ (u64::from(day) >> 8))
-        as usize
-        & 127
+    // Select the month parity and decimal day nibbles. Collisions with
+    // other months are harmless because the full date is checked.
+    (((prefix >> 48) as usize & 1) << 6) | ((day as usize & 3) << 4) | ((day as usize >> 8) & 15)
 }
 
 #[inline(always)]
@@ -222,6 +317,15 @@ mod tests {
                 let mut bytes = reference.to_vec();
                 for value in 0..=255 {
                     bytes[at] = value;
+                    let ingest = b"2011-12-31T01:12:39Z";
+                    assert_eq!(
+                        fast.event_times(&bytes, ingest, &calendar),
+                        Some((
+                            FastTime::ingest(ingest).unwrap(),
+                            calendar.timestamp(&bytes)
+                        )),
+                        "{bytes:?}"
+                    );
                     assert_eq!(
                         fast.timestamp(&bytes, &calendar),
                         calendar.timestamp(&bytes),
@@ -229,6 +333,27 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn paired_clock_preserves_ingest_order_throughout_day() {
+        let when = timestamp(b"2028-02-29T00:00:00Z").unwrap();
+        let calendar = Calendar::new(when);
+        let fast = FastTime::new(&calendar, when - WEEK, when, when + DAY_MS).unwrap();
+        const WEEK: i64 = 7 * DAY_MS;
+        for seconds in 0..86400 {
+            let stamp = format!(
+                "2028-02-29T{:02}:{:02}:{:02}Z",
+                seconds / 3600,
+                (seconds / 60) % 60,
+                seconds % 60
+            );
+            let b = stamp.as_bytes();
+            assert_eq!(
+                fast.event_times(b, b, &calendar),
+                Some((FastTime::ingest(b).unwrap(), Some(when + seconds * 1000)))
+            );
         }
     }
 
