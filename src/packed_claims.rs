@@ -369,6 +369,186 @@ impl LocalClaims {
     }
 }
 
+// Store the event itself in its claim partition. A normal zero-purchase row
+// needs no payload sidecar. Uncommon large timestamps use the same wide path
+// as purchases, including dates outside the compact relative range.
+#[derive(Clone, Copy)]
+struct ThinEvent {
+    event: Key,
+    user: Key,
+    ingest: u32,
+    payload: u32,
+}
+
+struct Region {
+    rows: Vec<ThinEvent>,
+    sidecar: Vec<(u32, u32)>,
+    codes: IngestCodes,
+}
+
+impl Region {
+    fn push(&mut self, row: Candidate) -> Option<()> {
+        if self.rows.is_empty() {
+            self.codes.prefix = row.ingest >> 31;
+        }
+        let payload = if row.ts == INVALID || (row.purchase == 0 && row.ts < WIDE) {
+            row.ts
+        } else {
+            let index = u32::try_from(self.sidecar.len()).ok()?;
+            if index >= WIDE - 1 {
+                return None;
+            }
+            self.sidecar.push((row.ts, row.purchase));
+            index | WIDE
+        };
+        self.rows.push(ThinEvent {
+            event: row.event,
+            user: row.user,
+            ingest: self.codes.encode(row.ingest)?,
+            payload,
+        });
+        Some(())
+    }
+}
+
+pub(super) struct InlineClaims {
+    parts: Vec<Vec<Region>>,
+    row_bits: u32,
+}
+
+impl InlineClaims {
+    pub(super) fn parse(
+        chunks: &[&[u8]],
+        dedup_count: usize,
+        parser: &Parser<'_, '_>,
+        windows: bool,
+    ) -> Option<Self> {
+        let size = chunks
+            .len()
+            .div_ceil(rayon::current_num_threads() * 8)
+            .max(1);
+        let tasks = chunks
+            .len()
+            .div_ceil(size)
+            .max(2)
+            .checked_next_power_of_two()?;
+        let row_bits = 32_u32.checked_sub(tasks.trailing_zeros())?;
+        let partial: Vec<_> = chunks
+            .par_chunks(size)
+            .map(|chunks| {
+                let n = chunks.iter().map(|chunk| chunk.len()).sum::<usize>() / 74 / dedup_count;
+                let mut regions: Vec<_> = (0..dedup_count)
+                    .map(|_| Region {
+                        rows: Vec::with_capacity(n),
+                        codes: IngestCodes::default(),
+                        sidecar: Vec::new(),
+                    })
+                    .collect();
+                let mut emit = |fields| {
+                    if let Some(row) = parser.event(fields)? {
+                        regions[bucket(row.event, dedup_count)].push(row)?;
+                    }
+                    Some(())
+                };
+                for chunk in chunks {
+                    if windows {
+                        for fields in RowWindows::new(chunk) {
+                            emit(fields)?;
+                        }
+                    } else {
+                        for fields in ChunkRows::new(chunk) {
+                            emit(fields)?;
+                        }
+                    }
+                }
+                regions
+                    .iter()
+                    .all(|r| r.rows.len() < (1_usize << row_bits))
+                    .then_some(regions)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut parts = buckets(dedup_count);
+        for tile in partial {
+            for (regions, group) in parts.iter_mut().zip(tile) {
+                if !group.rows.is_empty() {
+                    regions.push(group)
+                }
+            }
+        }
+        Some(Self { parts, row_bits })
+    }
+
+    pub(super) fn route(self, links: &Aliases, count: usize) -> Vec<Vec<Vec<Event>>> {
+        let Self { parts, row_bits } = self;
+        let row_mask = (1 << row_bits) - 1;
+        let partial = parts
+            .into_par_iter()
+            .map(|mut regions| {
+                let n = regions.iter().map(|r| r.rows.len()).sum::<usize>();
+                let mut slots = vec![0u64; (n + n / 2 + 1).next_power_of_two()];
+                let mask = slots.len() - 1;
+                for g in 0..regions.len() {
+                    for i in 0..regions[g].rows.len() {
+                        let row = regions[g].rows[i];
+                        let hash = row.event.hash();
+                        let loc = ((g as u32) << row_bits) | i as u32;
+                        let entry = (hash & 0xffff_ffff_0000_0000) | u64::from(loc + 1);
+                        let mut pos = hash as usize & mask;
+                        loop {
+                            let old = slots[pos];
+                            if old == 0 {
+                                slots[pos] = entry;
+                                break;
+                            }
+                            if (old ^ entry) >> 32 == 0 {
+                                let old_loc = old as u32 - 1;
+                                let j = (old_loc >> row_bits) as usize;
+                                let k = (old_loc & row_mask) as usize;
+                                let prev = regions[j].rows[k];
+                                if prev.event == row.event {
+                                    if regions[g].codes.decode(row.ingest)
+                                        < regions[j].codes.decode(prev.ingest)
+                                    {
+                                        regions[j].rows[k].payload = INVALID;
+                                        slots[pos] = entry;
+                                    } else {
+                                        regions[g].rows[i].payload = INVALID;
+                                    }
+                                    break;
+                                }
+                            }
+                            pos = (pos + 1) & mask;
+                        }
+                    }
+                }
+                let survivors = regions.into_iter().flat_map(|region| {
+                    region.rows.into_iter().filter_map(move |row| {
+                        if row.payload == INVALID {
+                            return None;
+                        }
+                        let (ts, purchase) = if row.payload < WIDE {
+                            (row.payload, 0)
+                        } else {
+                            region.sidecar[(row.payload ^ WIDE) as usize]
+                        };
+                        Some(Candidate {
+                            user: row.user,
+                            ts,
+                            purchase,
+                            ..Candidate::default()
+                        })
+                    })
+                });
+                let mut output: Vec<_> =
+                    (0..count).map(|_| Vec::with_capacity(n / count)).collect();
+                route(survivors, links, &mut output);
+                output
+            })
+            .collect();
+        transpose(partial, count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
