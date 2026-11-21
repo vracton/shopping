@@ -94,11 +94,13 @@ impl FastTime {
                 let mut index = date_slot(prefix, day);
                 let epoch_day = loop {
                     let atom = self.atoms[index];
-                    if atom.prefix == prefix && atom.day == day {
-                        break i64::from(atom.epoch_day);
-                    }
+                    // An empty slot has an all-zero key, which malformed
+                    // input can supply literally. Test occupancy first.
                     if atom.prefix == 0 {
                         return calendar.timestamp(bytes);
+                    }
+                    if atom.prefix == prefix && atom.day == day {
+                        break i64::from(atom.epoch_day);
                     }
                     index = (index + 1) & 127;
                 };
@@ -193,6 +195,16 @@ fn decimal_eight(word: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::input::timestamp;
+
+    #[test]
+    fn empty_date_atom_cannot_accept_a_timestamp_at_epoch() {
+        let base = -7 * DAY_MS;
+        let calendar = Calendar::new(0);
+        let fast = FastTime::new(&calendar, base, 0, DAY_MS).unwrap();
+        let mut bytes = *b"1970-01-01T03:04:05Z";
+        bytes[..10].fill(0);
+        assert_eq!(fast.timestamp(&bytes, &calendar), None);
+    }
 
     #[test]
     fn matches_calendar_for_all_single_byte_mutations() {
