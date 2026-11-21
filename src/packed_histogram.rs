@@ -13,6 +13,8 @@ struct Slot {
     user: Key,
     start: Counts,
     end: Counts,
+    limit: u32,
+    overflow: bool,
 }
 
 #[derive(Default)]
@@ -24,7 +26,7 @@ pub(super) struct Timelines {
 }
 
 impl Timelines {
-    pub(super) fn run(
+    pub(super) fn run<const SAMPLE: bool>(
         &mut self,
         (events, clicks): BucketPair,
         organic: usize,
@@ -34,7 +36,7 @@ impl Timelines {
     ) {
         let rows = events.iter().map(Vec::len).sum::<usize>();
         let touches = clicks.iter().map(Vec::len).sum::<usize>();
-        if rows > u32::MAX as usize || touches > u32::MAX as usize {
+        if rows > u32::MAX as usize / 4 || touches > u32::MAX as usize {
             counted.run((events, clicks), organic, base, out);
             return;
         }
@@ -42,8 +44,26 @@ impl Timelines {
         let bucket = |key: Key| key.hash() as usize & (slots - 1);
         self.counts.clear();
         self.counts.resize(slots, Counts::default());
-        for e in events.iter().flatten() {
-            self.counts[bucket(e.user)].events += 1;
+        if SAMPLE {
+            for group in &events {
+                for e in group.iter().step_by(8) {
+                    self.counts[bucket(e.user)].events += 1;
+                }
+            }
+            let mut capacity = 0usize;
+            for count in &mut self.counts {
+                let estimate = 8 + 12 * count.events as usize;
+                capacity += estimate;
+                if capacity > rows * 4 {
+                    counted.run((events, clicks), organic, base, out);
+                    return;
+                }
+                count.events = estimate as u32;
+            }
+        } else {
+            for e in events.iter().flatten() {
+                self.counts[bucket(e.user)].events += 1;
+            }
         }
         for c in clicks.iter().flatten() {
             self.counts[bucket(c.user)].clicks += 1;
@@ -56,12 +76,15 @@ impl Timelines {
                 user: Key::default(),
                 start,
                 end: start,
+                limit: start.events + count.events,
+                overflow: false,
             };
             start.events += count.events;
             start.clicks += count.clicks;
             cursor
         }));
-        self.events.resize(rows, TimelineEvent::default());
+        self.events
+            .resize(start.events as usize, TimelineEvent::default());
         self.clicks.resize(touches, TimelineClick::default());
         let mut other_events = Vec::new();
         let mut other_clicks = Vec::new();
@@ -71,16 +94,33 @@ impl Timelines {
                 slot.user = e.user;
             }
             if slot.user == e.user {
-                self.events[slot.end.events as usize] =
-                    TimelineEvent(u64::from(e.ts) << 32 | u64::from(e.purchase));
-                slot.end.events += 1;
+                if SAMPLE && slot.end.events == slot.limit {
+                    if !slot.overflow {
+                        // Move the whole shopper on a miss so its sessions cannot split.
+                        other_events.extend(
+                            self.events[slot.start.events as usize..slot.end.events as usize]
+                                .iter()
+                                .map(|v| Event {
+                                    ts: (v.0 >> 32) as u32,
+                                    purchase: v.0 as u32,
+                                    user: slot.user,
+                                }),
+                        );
+                        slot.overflow = true;
+                    }
+                    other_events.push(e);
+                } else {
+                    self.events[slot.end.events as usize] =
+                        TimelineEvent(u64::from(e.ts) << 32 | u64::from(e.purchase));
+                    slot.end.events += 1;
+                }
             } else {
                 other_events.push(e);
             }
         }
         for c in clicks.into_iter().flatten() {
             let slot = &mut self.slots[bucket(c.user)];
-            if slot.user == c.user {
+            if slot.user == c.user && (!SAMPLE || !slot.overflow) {
                 self.clicks[slot.end.clicks as usize] = TimelineClick {
                     ts: c.ts,
                     campaign: c.campaign,
@@ -91,7 +131,11 @@ impl Timelines {
                 other_clicks.push(c);
             }
         }
-        for s in self.slots.iter().filter(|s| s.user.0 != 0) {
+        for s in self
+            .slots
+            .iter()
+            .filter(|s| s.user.0 != 0 && (!SAMPLE || !s.overflow))
+        {
             let events = &mut self.events[s.start.events as usize..s.end.events as usize];
             let clicks = &mut self.clicks[s.start.clicks as usize..s.end.clicks as usize];
             clicks.sort_unstable_by_key(|c| (c.ts, c.id));

@@ -1259,8 +1259,15 @@ impl Parsed {
                     let mut histogram = histogram::Timelines::default();
                     for pair in job.buckets {
                         match mode.as_str() {
-                            "histogram" => {
-                                histogram.run(pair, organic, base, &mut daily, &mut counted)
+                            "histogram" => histogram.run::<false>(
+                                pair,
+                                organic,
+                                base,
+                                &mut daily,
+                                &mut counted,
+                            ),
+                            "sampled" => {
+                                histogram.run::<true>(pair, organic, base, &mut daily, &mut counted)
                             }
                             "pages" => pages.run(pair, organic, base, &mut daily, &mut counted),
                             "linked" => grouping.run(pair, organic, base, &mut daily),
