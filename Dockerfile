@@ -1,3 +1,5 @@
+ARG SHOPPING_WRITER=simple
+ARG SHOPPING_CLAIMS=off
 FROM rust:1.94-bookworm AS build
 WORKDIR /app
 RUN rustup component add llvm-tools-preview
@@ -5,6 +7,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY generator/generator/ generator/
 ARG TARGETARCH
+ARG SHOPPING_WRITER
+ARG SHOPPING_CLAIMS
 ENV CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 RUN set -eu; \
     if [ "$TARGETARCH" = amd64 ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3"; fi; \
@@ -16,7 +20,7 @@ RUN set -eu; \
       for mode in filter claims; do \
         DATA_DIR="/tmp/input-$seed" OUTPUT_DIR=/tmp/output NCPU=8 \
         SHOPPING_ARCH=indexed SHOPPING_DEDUP_MODE="$mode" SHOPPING_LINKS=sparse \
-        SHOPPING_WRITER=simple SHOPPING_ASSISTS=sweep \
+        SHOPPING_ASSISTS=sweep \
         LLVM_PROFILE_FILE=/tmp/profile/%p-%m.profraw target/release/shopping-sessions; \
       done; \
     done; \
@@ -25,11 +29,14 @@ RUN set -eu; \
     cargo rustc --locked --release -- -C profile-use=/tmp/training.profdata
 
 FROM debian:bookworm-slim
+ARG SHOPPING_WRITER
+ARG SHOPPING_CLAIMS
 RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/shopping-sessions /usr/local/bin/shopping-sessions
 ENV LD_PRELOAD=libjemalloc.so.2 \
     MALLOC_CONF=thp:always,metadata_thp:always,dirty_decay_ms:-1,muzzy_decay_ms:-1 \
     SHOPPING_ARCH=indexed SHOPPING_DEDUP_MODE=claims SHOPPING_DEDUP_PARTITIONS=128 \
-    SHOPPING_LINKS=sparse SHOPPING_ASSISTS=sweep SHOPPING_WRITER=simple SHOPPING_EXIT=kernel
+    SHOPPING_LINKS=sparse SHOPPING_ASSISTS=sweep SHOPPING_EXIT=kernel \
+    SHOPPING_WRITER=${SHOPPING_WRITER} SHOPPING_CLAIMS=${SHOPPING_CLAIMS}
 USER 1000:1000
 ENTRYPOINT ["/usr/local/bin/shopping-sessions"]
