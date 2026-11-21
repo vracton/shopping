@@ -17,6 +17,8 @@ mod split;
 
 #[path = "packed_claims.rs"]
 mod claims;
+#[path = "packed_fused.rs"]
+mod fused;
 
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
@@ -984,6 +986,7 @@ fn aggregate_sorted(
 }
 
 enum EventInput {
+    Fused(fused::Batch),
     Claims(claims::ClaimBatch),
     ById(Vec<Vec<Vec<Candidate>>>),
     ByPerson(split::SplitEvents),
@@ -1092,7 +1095,22 @@ pub fn parse_inputs(
     };
     let split_route = indexed
         && std::env::var_os("SHOPPING_ROUTE").as_deref() == Some(std::ffi::OsStr::new("split"));
-    let (events, clicks, links) = if split_route {
+    let fused_mode = indexed
+        .then(|| std::env::var("SHOPPING_FUSED").ok())
+        .flatten();
+    let (events, clicks, links) = if fused_mode.as_deref() == Some("canonical") {
+        let (links, clicks) = rayon::join(decode_links, decode_clicks);
+        let links = links?;
+        let batch = fused::Batch::parse(
+            events,
+            &parser,
+            Some(&links),
+            count,
+            dedup_count,
+            window_rows,
+        )?;
+        (EventInput::Fused(batch), clicks?, links)
+    } else if split_route {
         let (links, clicks) = rayon::join(decode_links, decode_clicks);
         let links = links?;
         let events = Stages::span(profile, "split_decode", || {
@@ -1105,6 +1123,17 @@ pub fn parse_inputs(
                 rayon::join(
                     || {
                         Stages::span(profile, "event_decode_and_scatter", || {
+                            if fused_mode.as_deref() == Some("raw") {
+                                return fused::Batch::parse(
+                                    events,
+                                    &parser,
+                                    None,
+                                    count,
+                                    dedup_count,
+                                    window_rows,
+                                )
+                                .map(EventInput::Fused);
+                            }
                             if indexed
                                 && std::env::var_os("SHOPPING_DEDUP_MODE")
                                     .is_some_and(|m| m == "claims")
@@ -1173,6 +1202,7 @@ impl Parsed {
         let (events, clicks) = rayon::join(
             || {
                 Stages::span(profile, "event_dedup_and_route", || match events {
+                    EventInput::Fused(batch) => batch.finish(&links, count),
                     EventInput::Claims(batch) => batch.route(&links, count),
                     EventInput::ByPerson(routed) => routed.winners(count, profile),
                     EventInput::ById(groups) => {
