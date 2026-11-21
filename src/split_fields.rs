@@ -2,7 +2,7 @@
 //! SIMD vector contains the two IDs. All other layouts use the general scanner.
 use std::arch::x86_64::*;
 
-struct Masks {
+pub(super) struct Masks {
     commas: u32,
     quotes: u32,
     newlines: u32,
@@ -15,7 +15,7 @@ fn join(low: u32, high: u32) -> u64 {
 
 // Caller provides 32 readable bytes.
 #[inline(always)]
-unsafe fn masks(p: *const u8) -> Masks {
+pub(super) unsafe fn masks(p: *const u8) -> Masks {
     unsafe {
         let v = _mm256_loadu_si256(p.cast());
         let eq = |c| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c))) as u32;
@@ -40,20 +40,51 @@ pub(super) fn event<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
             masks(data.as_ptr().add(64)),
         )
     };
+    event_masks(
+        data,
+        first,
+        join(middle.newlines, last.newlines),
+        join(middle.commas, last.commas),
+        join(middle.quotes, last.quotes),
+        suffix_ranks,
+    )
+}
+
+#[inline(always)]
+pub(super) fn suffix_ranks(separators: u64, inside: u64) -> [usize; 4] {
+    let time_end = 32 + separators.trailing_zeros() as usize;
+    let ingest_end = 32 + (separators & (separators - 1)).trailing_zeros() as usize;
+    let before_last = separators & inside;
+    let product_end = 95 - before_last.leading_zeros() as usize;
+    let kind_end = unsafe { 32 + _pdep_u64(4, separators).trailing_zeros() as usize };
+    [time_end, ingest_end, kind_end, product_end]
+}
+
+#[inline(always)]
+pub(super) fn event_masks<const N: usize>(
+    data: &[u8],
+    first: Masks,
+    lf: u64,
+    commas: u64,
+    quote_mask: u64,
+    ranks: impl FnOnce(u64, u64) -> [usize; 4],
+) -> Option<(usize, Option<[&[u8]; N]>)> {
+    if N != 7 || data.len() < 96 {
+        return None;
+    }
     if first.newlines != 0 || first.commas.count_ones() != 2 || first.commas >> 31 != 0 {
         return None;
     }
-    let lf = join(middle.newlines, last.newlines);
     if lf == 0 {
         return None;
     }
     let end = 32 + lf.trailing_zeros() as usize;
     let inside = !lf & lf.wrapping_sub(1);
-    let separators = (join(middle.commas, last.commas) & inside) | (lf & lf.wrapping_neg());
+    let separators = (commas & inside) | (lf & lf.wrapping_neg());
     if separators.count_ones() != 5 {
         return Some((end, None));
     }
-    let quotes = join(middle.quotes, last.quotes) & inside;
+    let quotes = quote_mask & inside;
     // Each quote must touch exactly one end of its field. The high word
     // starts inside field 3, so three opening bits and two closing bits
     // precede it. A quote at byte 31 can close at the first high separator.
@@ -78,11 +109,7 @@ pub(super) fn event<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
     // remaining commas can be selected without waiting for the IDs' cuts.
     let id_end = first.commas.trailing_zeros() as usize;
     let user_end = 31 - first.commas.leading_zeros() as usize;
-    let time_end = 32 + separators.trailing_zeros() as usize;
-    let ingest_end = 32 + (separators & (separators - 1)).trailing_zeros() as usize;
-    let before_last = separators & inside;
-    let product_end = 95 - before_last.leading_zeros() as usize;
-    let kind_end = unsafe { 32 + _pdep_u64(4, separators).trailing_zeros() as usize };
+    let [time_end, ingest_end, kind_end, product_end] = ranks(separators, inside);
     let cuts = [
         0,
         id_end + 1,
@@ -107,21 +134,38 @@ pub(super) fn event<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
 #[inline(always)]
 pub(super) fn short<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]; N]>)> {
     let data = data.get(..64)?;
-    let expected_commas = N.checked_sub(1)?;
     let (first, second) = unsafe { (masks(data.as_ptr()), masks(data.as_ptr().add(32))) };
-    let lf = join(first.newlines, second.newlines);
+    short_masks(
+        data,
+        join(first.newlines, second.newlines),
+        join(first.commas, second.commas),
+        join(first.quotes, second.quotes),
+    )
+}
+
+#[inline(always)]
+pub(super) fn short_masks<const N: usize>(
+    data: &[u8],
+    lf: u64,
+    comma_mask: u64,
+    quote_mask: u64,
+) -> Option<(usize, Option<[&[u8]; N]>)> {
+    if data.len() < 64 {
+        return None;
+    }
+    let expected_commas = N.checked_sub(1)?;
     if lf == 0 {
         return None;
     }
     let end = lf.trailing_zeros() as usize;
     let inside = !lf & lf.wrapping_sub(1);
-    let mut commas = join(first.commas, second.commas) & inside;
+    let mut commas = comma_mask & inside;
     if end == 0 || commas.count_ones() as usize != expected_commas {
         return Some((end, None));
     }
     let boundaries = commas | (lf & lf.wrapping_neg());
     let starts = commas << 1 | 1;
-    let quotes = join(first.quotes, second.quotes) & inside;
+    let quotes = quote_mask & inside;
     let open = unsafe { _pext_u64(quotes, starts) };
     if quotes & !(starts ^ (boundaries >> 1)) != 0
         || open != unsafe { _pext_u64(quotes << 1, boundaries) }

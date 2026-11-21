@@ -67,6 +67,15 @@ impl ClaimBatch {
                 };
                 for chunk in chunks {
                     if windows {
+                        #[cfg(all(
+                            target_arch = "x86_64",
+                            target_feature = "avx2",
+                            target_feature = "bmi2"
+                        ))]
+                        if let Some(scanner) = crate::input::isa_wide::scanner() {
+                            scanner.visit(chunk, &mut emit)?;
+                            continue;
+                        }
                         for row in RowWindows::new(chunk) {
                             emit(row)?;
                         }

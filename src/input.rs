@@ -532,18 +532,39 @@ impl Calendar {
     target_feature = "avx2",
     target_feature = "bmi2"
 ))]
+#[path = "isa_wide.rs"]
+pub(crate) mod isa_wide;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+))]
 #[path = "split_fields.rs"]
 mod split_fields;
 
 /// A row-oriented scanner that extracts every field boundary from two masks.
 /// Fixed-width loads are only used when the complete load is inside the shard.
 pub struct RowWindows<'a, const N: usize> {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi2"
+    ))]
+    wide: Option<isa_wide::Scanner>,
     remaining: &'a [u8],
 }
 
 impl<'a, const N: usize> RowWindows<'a, N> {
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
+        Self {
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx2",
+                target_feature = "bmi2"
+            ))]
+            wide: if N == 7 { None } else { isa_wide::scanner() },
+            remaining: bytes,
+        }
     }
 }
 
@@ -561,6 +582,8 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
             ))]
             if let Some((end, fields)) = if N == 7 {
                 split_fields::event(bytes)
+            } else if let Some(wide) = self.wide {
+                wide.short(bytes)
             } else {
                 split_fields::short(bytes)
             } {
