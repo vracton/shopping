@@ -248,7 +248,7 @@ impl<'a, const N: usize> ChunkRows<'a, N> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn boundary(&mut self) -> (usize, u32) {
         let mut count = 0;
         while self.separators == 0 {
@@ -274,7 +274,7 @@ impl<'a, const N: usize> ChunkRows<'a, N> {
 impl<'a, const N: usize> Iterator for ChunkRows<'a, N> {
     type Item = [&'a [u8]; N];
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         while self.start < self.bytes.len() {
             let mut values = [&[][..]; N];
@@ -518,7 +518,7 @@ impl<'a, const N: usize> RowWindows<'a, N> {
 impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
     type Item = [&'a [u8]; N];
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         while !self.remaining.is_empty() {
             let bytes = self.remaining;

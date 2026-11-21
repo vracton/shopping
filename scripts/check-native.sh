@@ -16,7 +16,7 @@ run_pipeline() {
         SHOPPING_CHUNK_KIB="$5" SHOPPING_PARTITIONS="$6" SHOPPING_PARQUET_ROWS="$7" "$binary"
 }
 
-for arch in sort hash packed; do
+for arch in sort hash packed indexed; do
     # Exercise single-bucket, single-thread execution and non-power-of-two sizing.
     for configuration in '8 2048 32 65536' '1 1 1 1' '4 7 7 17'; do
         set -- $configuration

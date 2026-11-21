@@ -10,6 +10,9 @@ use crate::fast_time::FastTime;
 use crate::input::{Calendar, ChunkRows, DAY_MS, RowWindows, WEEK_MS, data_rows, decimal, fields};
 use crate::stages::Stages;
 
+#[path = "packed_route.rs"]
+mod split;
+
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
 
@@ -17,6 +20,7 @@ const PRICE_MASK: u32 = (1 << 24) - 1;
 pub struct Key(u64);
 
 impl Key {
+    #[inline(always)]
     fn pack(id: &[u8]) -> Option<Self> {
         match id.len() {
             8 | 9 => {
@@ -67,6 +71,7 @@ impl Key {
         std::str::from_utf8(&buffer[..len]).unwrap()
     }
 
+    #[inline(always)]
     fn hash(self) -> u64 {
         FxBuildHasher.hash_one(self.0)
     }
@@ -306,7 +311,7 @@ struct Parser<'a, 'b> {
 }
 
 impl Parser<'_, '_> {
-    #[inline]
+    #[inline(always)]
     fn timestamp(&self, bytes: &[u8]) -> Option<i64> {
         if let Some(fast) = &self.fast_time {
             fast.timestamp(bytes, &self.calendar)
@@ -315,6 +320,7 @@ impl Parser<'_, '_> {
         }
     }
 
+    #[inline(always)]
     fn event(
         &self,
         [id, user, ts, ingest, kind, product, price]: [&[u8]; 7],
@@ -373,6 +379,7 @@ impl Parser<'_, '_> {
         Some(Some(candidate))
     }
 
+    #[inline(always)]
     fn click(&self, [id, user, campaign, ts]: [&[u8]; 4]) -> Option<Option<Click>> {
         if id.is_empty() || user.is_empty() {
             return Some(None);
@@ -637,7 +644,10 @@ fn route(rows: impl Iterator<Item = Candidate>, links: &Aliases, output: &mut [V
     }
 }
 
-fn flatten<T>(groups: Vec<Vec<T>>) -> Vec<T> {
+fn flatten<T>(mut groups: Vec<Vec<T>>) -> Vec<T> {
+    if groups.len() == 1 {
+        return groups.pop().unwrap();
+    }
     let mut output = Vec::with_capacity(groups.iter().map(Vec::len).sum());
     for mut group in groups {
         output.append(&mut group)
@@ -943,8 +953,13 @@ fn aggregate_sorted(
     }
 }
 
+enum EventInput {
+    ById(Vec<Vec<Vec<Candidate>>>),
+    ByPerson(split::SplitEvents),
+}
+
 pub struct Parsed {
-    events: Vec<Vec<Vec<Candidate>>>,
+    events: EventInput,
     clicks: Vec<Vec<Click>>,
     links: Aliases,
     base: i64,
@@ -1001,65 +1016,79 @@ pub fn parse_inputs(
     };
     let window_rows =
         indexed && std::env::var_os("SHOPPING_SCANNER").is_none_or(|mode| mode != "block");
-    let ((events, clicks), links) = rayon::join(
-        || {
-            rayon::join(
-                || {
-                    Stages::span(profile, "event_decode_and_scatter", || {
-                        parse(
-                            events,
-                            dedup_count,
-                            window_rows,
-                            |r| parser.event(r),
-                            |item| item.event,
-                        )
-                    })
-                },
-                || {
-                    Stages::span(profile, "click_decode", || {
-                        clicks
-                            .par_iter()
-                            .map(|chunk| {
-                                let mut output = Vec::new();
-                                let mut push = |row| {
-                                    if let Some(click) = parser.click(row)? {
-                                        output.push(click);
-                                    }
-                                    Some(())
-                                };
-                                if window_rows {
-                                    for row in RowWindows::new(chunk) {
-                                        push(row)?;
-                                    }
-                                } else {
-                                    for row in ChunkRows::new(chunk) {
-                                        push(row)?;
-                                    }
-                                }
-                                Some(output)
-                            })
-                            .collect::<Option<Vec<_>>>()
-                    })
-                },
-            )
-        },
-        || {
-            Stages::span(profile, "link_decode_and_union", || {
-                if indexed
-                    && std::env::var_os("SHOPPING_LINKS").as_deref()
-                        == Some(std::ffi::OsStr::new("parallel"))
-                {
-                    Aliases::parallel(link_chunks)
-                } else {
-                    Links::new(link_files.iter().copied()).map(Aliases::Serial)
-                }
-            })
-        },
-    );
+    let decode_clicks = || {
+        Stages::span(profile, "click_decode", || {
+            clicks
+                .par_iter()
+                .map(|chunk| {
+                    let mut output = Vec::with_capacity(chunk.len() / 45);
+                    let mut push = |row| {
+                        if let Some(click) = parser.click(row)? {
+                            output.push(click);
+                        }
+                        Some(())
+                    };
+                    if window_rows {
+                        for row in RowWindows::new(chunk) {
+                            push(row)?;
+                        }
+                    } else {
+                        for row in ChunkRows::new(chunk) {
+                            push(row)?;
+                        }
+                    }
+                    Some(output)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+    };
+    let decode_links = || {
+        Stages::span(profile, "link_decode_and_union", || {
+            if indexed
+                && std::env::var_os("SHOPPING_LINKS").as_deref()
+                    == Some(std::ffi::OsStr::new("parallel"))
+            {
+                Aliases::parallel(link_chunks)
+            } else {
+                Links::new(link_files.iter().copied()).map(Aliases::Serial)
+            }
+        })
+    };
+    let split_route = indexed
+        && std::env::var_os("SHOPPING_ROUTE").as_deref() == Some(std::ffi::OsStr::new("split"));
+    let (events, clicks, links) = if split_route {
+        let (links, clicks) = rayon::join(decode_links, decode_clicks);
+        let links = links?;
+        let events = Stages::span(profile, "split_decode", || {
+            split::decode(events, &parser, &links, count, dedup_count, window_rows)
+        })?;
+        (EventInput::ByPerson(events), clicks?, links)
+    } else {
+        let ((events, clicks), links) = rayon::join(
+            || {
+                rayon::join(
+                    || {
+                        Stages::span(profile, "event_decode_and_scatter", || {
+                            parse(
+                                events,
+                                dedup_count,
+                                window_rows,
+                                |row| parser.event(row),
+                                |item| item.event,
+                            )
+                        })
+                    },
+                    decode_clicks,
+                )
+            },
+            decode_links,
+        );
+        (EventInput::ById(events?), clicks?, links?)
+    };
     Some(Parsed {
-        events: events?,
-        clicks: clicks?,
-        links: links?,
+        events,
+        clicks,
+        links,
         base,
         first_day: window.start.div_euclid(DAY_MS) as i32,
         days: ((window.end - 1).div_euclid(DAY_MS) - window.start.div_euclid(DAY_MS) + 1) as usize,
@@ -1094,11 +1123,15 @@ impl Parsed {
         let profile = stages.enabled();
         let (events, clicks) = rayon::join(
             || {
-                Stages::span(profile, "event_dedup_and_route", || {
-                    events
-                        .into_par_iter()
-                        .map(|group| choose(group, &links, count))
-                        .collect()
+                Stages::span(profile, "event_dedup_and_route", || match events {
+                    EventInput::ByPerson(routed) => routed.winners(count, profile),
+                    EventInput::ById(groups) => {
+                        let parts = groups
+                            .into_par_iter()
+                            .map(|group| choose(group, &links, count))
+                            .collect();
+                        transpose(parts, count)
+                    }
                 })
             },
             || {
@@ -1117,7 +1150,6 @@ impl Parsed {
                 })
             },
         );
-        let events = transpose(events, count);
         let clicks = transpose(clicks, count);
         stages.mark("packed_dedup_and_partition");
         if indexed {

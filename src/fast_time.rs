@@ -56,7 +56,7 @@ impl FastTime {
         Some(result)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn ingest(bytes: &[u8]) -> Option<u64> {
         let bytes: &[u8; 20] = bytes.try_into().ok()?;
         // Ingest is guaranteed to be valid F1. Decimal nibbles preserve its
@@ -67,7 +67,7 @@ impl FastTime {
         Some((extract(front, DAY_NIBBLES) << 32) | (day << 24) | extract(clock, TIME_NIBBLES))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_late(&self, code: u64, relative: u32) -> bool {
         let cutoff_date = self.cutoffs[(relative / DAY_MS as u32 + 1) as usize];
         let date = code >> 24;
@@ -76,7 +76,7 @@ impl FastTime {
                 && clock_seconds(code) > u64::from((relative % DAY_MS as u32) / 1000))
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn timestamp(&self, bytes: &[u8], calendar: &Calendar) -> Option<i64> {
         match bytes.len() {
             13 => {
@@ -130,14 +130,14 @@ fn bcd(mut n: u64, digits: u32) -> u64 {
     result
 }
 
-#[inline]
+#[inline(always)]
 fn date_slot(prefix: u64, day: u16) -> usize {
     ((prefix >> 40).wrapping_mul(241) ^ u64::from(day).wrapping_mul(109) ^ (u64::from(day) >> 8))
         as usize
         & 127
 }
 
-#[inline]
+#[inline(always)]
 fn extract(word: u64, mask: u64) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
@@ -159,26 +159,26 @@ fn extract(word: u64, mask: u64) -> u64 {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn clock_parts(code: u64) -> (u64, u64, u64) {
     let pair = |shift: u32| ((code >> (shift + 4)) & 15_u64) * 10 + ((code >> shift) & 15_u64);
     (pair(16), pair(8), pair(0))
 }
 
-#[inline]
+#[inline(always)]
 fn clock_seconds(code: u64) -> u64 {
     let (hour, minute, second) = clock_parts(code);
     (hour * 60 + minute) * 60 + second
 }
 
-#[inline]
+#[inline(always)]
 fn ascii_digits(word: u64, lanes: u64) -> bool {
     let high = (word ^ 0x3030_3030_3030_3030) & 0xf0f0_f0f0_f0f0_f0f0;
     let overflow = ((word & DIGITS) + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010;
     (high | overflow) & lanes == 0
 }
 
-#[inline]
+#[inline(always)]
 fn decimal_eight(word: u64) -> Option<u64> {
     if !ascii_digits(word, u64::MAX) {
         return None;

@@ -16,7 +16,7 @@ from bench import positive_int, run_pipeline
 
 def parse_candidate(value):
     parts = value.split(",")
-    if len(parts) != 5 or parts[0] not in ("sort", "hash", "packed"):
+    if len(parts) != 5 or parts[0] not in ("sort", "hash", "packed", "indexed"):
         raise argparse.ArgumentTypeError("expected ARCH,CHUNK_KIB,PARTITIONS,PARQUET_ROWS,WORKERS")
     return (parts[0], *(positive_int(part) for part in parts[1:]))
 

@@ -162,17 +162,21 @@ fn run(config: &Config) -> Result<()> {
         ) {
             stages.mark("packed_parse_and_links");
             drop((event_chunks, click_chunks, link_chunks));
-            let ((), daily) = rayon::join(
-                || drop((event_maps, click_maps, links)),
-                || {
-                    parsed.aggregate(
-                        config.partitions,
-                        catalog.organic,
-                        matches!(config.architecture, Architecture::Indexed),
-                        &mut stages,
-                    )
-                },
-            );
+            let fast_exit = env::var_os("SHOPPING_EXIT").is_some_and(|value| value == "kernel");
+            let mut resources = Some((event_maps, click_maps, links));
+            let aggregate = || {
+                parsed.aggregate(
+                    config.partitions,
+                    catalog.organic,
+                    matches!(config.architecture, Architecture::Indexed),
+                    &mut stages,
+                )
+            };
+            let daily = if fast_exit {
+                aggregate()
+            } else {
+                rayon::join(|| drop(resources.take()), aggregate).1
+            };
             stages.mark("packed_order_and_aggregate");
             output::write(
                 &config.output,
@@ -182,6 +186,11 @@ fn run(config: &Config) -> Result<()> {
                 config.parquet_rows,
             )?;
             stages.mark("parquet");
+            if fast_exit {
+                // The writers have closed successfully. Let process teardown
+                // reclaim the large anonymous and read-only file mappings.
+                std::process::exit(0);
+            }
             drop(daily);
             stages.mark("drop_aggregates");
             return Ok(());
