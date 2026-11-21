@@ -133,8 +133,17 @@ fn run(config: &Config) -> Result<()> {
     );
     let (event_maps, click_maps) = (event_maps?, click_maps?);
     stages.mark("open_and_map");
-    let event_chunks = chunks(&event_maps, config.chunk_bytes);
-    let click_chunks = chunks(&click_maps, config.chunk_bytes);
+    let input_chunks = |files| {
+        if matches!(config.architecture, Architecture::Indexed) {
+            input::scheduled_chunks(files, config.chunk_bytes)
+        } else {
+            chunks(files, config.chunk_bytes)
+        }
+    };
+    let (event_chunks, click_chunks) = rayon::join(
+        || input_chunks(&event_maps[..]),
+        || input_chunks(&click_maps[..]),
+    );
     let link_chunks = chunks(&links, config.chunk_bytes);
     stages.mark("chunk_boundaries");
     if matches!(

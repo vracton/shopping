@@ -2,10 +2,10 @@
 //! Only potential duplicates read the full ID and ingest timestamp.
 use super::*;
 
-struct MarkedEvent {
-    user: Key,
-    ts: std::sync::atomic::AtomicU32,
-    purchase: u32,
+pub(super) struct MarkedEvent {
+    pub(super) user: Key,
+    pub(super) ts: std::sync::atomic::AtomicU32,
+    pub(super) purchase: u32,
 }
 
 pub(super) struct ClaimBatch {
@@ -89,7 +89,7 @@ impl ClaimBatch {
         })
     }
 
-    pub(super) fn route(self, links: &Aliases, count: usize) -> Vec<Vec<Vec<Event>>> {
+    pub(super) fn winners(self) -> Vec<Vec<MarkedEvent>> {
         use std::sync::atomic::Ordering::Relaxed;
         let Self {
             metadata,
@@ -126,16 +126,15 @@ impl ClaimBatch {
                     conflicts[word] |= old & bit;
                     seen[word] = old | bit;
                 }
-                // Exact slot capacity must fit even a pathological set of
-                // different keys mapped onto one bit.
-                groups
+                // A set bit in seen but not conflicts represents exactly one row.
+                // Subtract those rows to obtain the exact upper bound for the table,
+                // even when many different full keys map to a single fingerprint.
+                let singletons: usize = seen
                     .iter()
-                    .flatten()
-                    .filter(|&&entry| {
-                        let h = (entry >> 32) as usize;
-                        conflicts[(h >> 6) & (words - 1)] >> (h & 63) & 1 != 0
-                    })
-                    .count()
+                    .zip(&conflicts)
+                    .map(|(&present, &repeated)| (present ^ repeated).count_ones() as usize)
+                    .sum();
+                n - singletons
             } else {
                 n
             };
@@ -174,8 +173,12 @@ impl ClaimBatch {
                 }
             }
         });
-        drop(metadata);
-        let parts = events
+        events
+    }
+
+    pub(super) fn route(self, links: &Aliases, count: usize) -> Vec<Vec<Vec<Event>>> {
+        let parts = self
+            .winners()
             .into_par_iter()
             .map(|rows| {
                 let mut output: Vec<_> = (0..count)

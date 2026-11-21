@@ -110,6 +110,30 @@ pub fn chunks<T: AsRef<[u8]>>(files: &[T], chunk_bytes: usize) -> Vec<&[u8]> {
         .collect()
 }
 
+/// Issue bounded read-ahead requests while separate workers locate row boundaries.
+/// Hints are optional. The ordinary slice scanner still consumes every input row.
+pub fn scheduled_chunks(files: &[Shard], chunk_bytes: usize) -> Vec<&[u8]> {
+    use rayon::prelude::*;
+    let groups: Vec<Vec<_>> = files
+        .par_iter()
+        .map(|file| {
+            #[cfg(unix)]
+            if let Shard::Mapped(map) = file {
+                const BATCH: usize = 512 * 1024;
+                for offset in (0..map.len()).step_by(BATCH) {
+                    let _ = map.advise_range(
+                        memmap2::Advice::WillNeed,
+                        offset,
+                        BATCH.min(map.len() - offset),
+                    );
+                }
+            }
+            byte_chunks(without_header(file.as_ref()), chunk_bytes).collect()
+        })
+        .collect();
+    groups.into_iter().flatten().collect()
+}
+
 pub fn fields<const N: usize>(row: &[u8]) -> Option<[&[u8]; N]> {
     if row.is_empty() {
         return None;
@@ -503,6 +527,14 @@ impl Calendar {
     }
 }
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+))]
+#[path = "split_fields.rs"]
+mod split_fields;
+
 /// A row-oriented scanner that extracts every field boundary from two masks.
 /// Fixed-width loads are only used when the complete load is inside the shard.
 pub struct RowWindows<'a, const N: usize> {
@@ -522,6 +554,22 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
     fn next(&mut self) -> Option<Self::Item> {
         while !self.remaining.is_empty() {
             let bytes = self.remaining;
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx2",
+                target_feature = "bmi2"
+            ))]
+            if let Some((end, fields)) = if N == 7 {
+                split_fields::event(bytes)
+            } else {
+                split_fields::short(bytes)
+            } {
+                self.remaining = &bytes[end + 1..];
+                if let Some(fields) = fields {
+                    return Some(fields);
+                }
+                continue;
+            }
             if bytes.len() >= 128 {
                 let (newline, commas, quotes) = row_masks(bytes);
                 if newline != 0 {

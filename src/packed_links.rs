@@ -135,6 +135,7 @@ mod tests {
                 .split_inclusive(|&byte| byte == b'\n')
                 .collect();
             let table = Sparse::new(&chunks).unwrap();
+            let tokens = super::super::tokens::Directory::new(&chunks, 4 << 20, 8).unwrap();
             for name in names
                 .iter()
                 .map(String::as_bytes)
@@ -142,6 +143,7 @@ mod tests {
             {
                 let key = Key::pack(name).unwrap();
                 assert_eq!(table.resolve(key), reference.resolve(key), "{name:?}");
+                assert_eq!(tokens.resolve(key), reference.resolve(key), "{name:?}");
             }
         }
     }
