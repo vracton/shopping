@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::input::{data_rows, fields};
+use crate::input::{RowWindows, data_rows, fields, without_header};
 
 pub struct Catalog<'a> {
     users: FxHashMap<&'a [u8], &'a [u8]>,
@@ -24,16 +24,31 @@ impl<'a> Catalog<'a> {
         campaigns: &'a [u8],
     ) -> Self {
         let users = linked_users(links);
-        let product_rows: Vec<_> = data_rows(products).filter_map(fields::<2>).collect();
-        let mut categories = vec![&b"unknown"[..]];
-        categories.extend(product_rows.iter().map(|row| row[1]));
+        let mut names: Vec<&[u8]> = vec![b"unknown"];
+        let mut category_ids = FxHashMap::default();
+        category_ids.insert(names[0], 0);
+        let body = without_header(products);
+        let rows = memchr::memchr_iter(b'\n', body).count();
+        let mut products_by_id = FxHashMap::with_capacity_and_hasher(rows, Default::default());
+        for [id, category] in RowWindows::<2>::new(body) {
+            let number = *category_ids.entry(category).or_insert_with(|| {
+                let n = names.len();
+                names.push(category);
+                n
+            });
+            products_by_id.insert(id, number);
+        }
+        let mut categories = names.clone();
         categories.sort_unstable();
-        categories.dedup();
-        let unknown = categories.binary_search(&&b"unknown"[..]).unwrap();
-        let products = product_rows
-            .into_iter()
-            .map(|[id, category]| (id, categories.binary_search(&category).unwrap()))
+        let remap: Vec<_> = names
+            .iter()
+            .map(|category| categories.binary_search(category).unwrap())
             .collect();
+        let unknown = remap[0];
+        for category in products_by_id.values_mut() {
+            *category = remap[*category];
+        }
+        let products = products_by_id;
         let mut campaigns: Vec<_> = data_rows(campaigns)
             .filter_map(fields::<2>)
             .map(|[id, channel]| Campaign { id, channel })

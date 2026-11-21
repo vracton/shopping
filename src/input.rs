@@ -62,7 +62,7 @@ pub fn map_shards(path: &Path) -> io::Result<Vec<Mmap>> {
     Ok(maps)
 }
 
-fn without_header(bytes: &[u8]) -> &[u8] {
+pub(crate) fn without_header(bytes: &[u8]) -> &[u8] {
     memchr(b'\n', bytes).map_or(&[], |end| &bytes[end + 1..])
 }
 
