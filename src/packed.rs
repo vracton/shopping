@@ -656,6 +656,12 @@ fn route_groups(groups: Vec<Vec<Candidate>>, links: &Aliases, output: &mut [Vec<
 }
 
 fn route(rows: impl Iterator<Item = Candidate>, links: &Aliases, output: &mut [Vec<Event>]) {
+    if let Aliases::Sparse(table) = links
+        && std::env::var_os("SHOPPING_ALIAS_ROUTE").is_some_and(|v| v == "batch")
+    {
+        table.route_batched(rows, output);
+        return;
+    }
     // Frequent aliases can bypass the larger catalog table.
     let mut cache = [(Key(0), Key(0)); 1024];
     let count = output.len();
@@ -1083,6 +1089,8 @@ pub fn parse_inputs(
                     == Some(std::ffi::OsStr::new("sparse"))
             {
                 sparse_links::Sparse::new(link_chunks).map(Aliases::Sparse)
+            } else if indexed && std::env::var_os("SHOPPING_LINKS").is_some_and(|s| s == "concurrent") {
+                sparse_links::Sparse::concurrent(link_chunks).map(Aliases::Sparse)
             } else if indexed
                 && std::env::var_os("SHOPPING_LINKS").as_deref()
                     == Some(std::ffi::OsStr::new("parallel"))
