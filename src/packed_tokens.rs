@@ -285,7 +285,8 @@ impl Directory {
         days: usize,
         organic: usize,
         stages: &mut Stages,
-    ) -> Vec<Daily<'static>> {
+        output: Option<&crate::output::BucketOutput>,
+    ) -> crate::Result<Vec<Daily<'static>>> {
         let (events, clicks) = rayon::join(
             || self.aggregate_events(batch),
             || self.route_clicks(clicks),
@@ -320,7 +321,9 @@ impl Directory {
         let jobs = balance(parts);
         stages.mark("packed_dedup_and_partition");
         jobs.into_par_iter()
-            .map(|job| {
+            .enumerate()
+            .map(|(index, job)| {
+                let mut writer = output.map(|out| out.open(index)).transpose()?;
                 let mut daily = Daily {
                     users: Vec::new(),
                     campaigns: CampaignDaily::dense(first_day, days, organic + 1),
@@ -370,8 +373,15 @@ impl Directory {
                             &mut daily,
                         );
                     }
+                    if let (Some(out), Some(writer)) = (output, &mut writer) {
+                        out.append(writer, &daily.users)?;
+                        daily.users.clear();
+                    }
                 }
-                daily
+                if let Some(writer) = writer {
+                    writer.close()?;
+                }
+                Ok(daily)
             })
             .collect()
     }

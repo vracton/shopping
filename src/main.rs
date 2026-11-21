@@ -173,21 +173,25 @@ fn run(config: &Config) -> Result<()> {
             drop((event_chunks, click_chunks, link_chunks));
             let fast_exit = env::var_os("SHOPPING_EXIT").is_some_and(|value| value == "kernel");
             let mut resources = Some((event_maps, click_maps, links));
+            let bucket_output =
+                output::BucketOutput::prepare(&config.output, &catalog, config.parquet_rows)?;
             let aggregate = || {
                 parsed.aggregate(
                     config.partitions,
                     catalog.organic,
                     matches!(config.architecture, Architecture::Indexed),
                     &mut stages,
+                    bucket_output.as_ref(),
                 )
             };
-            let daily = if fast_exit {
+            let (daily, users_written) = if fast_exit {
                 aggregate()
             } else {
                 rayon::join(|| drop(resources.take()), aggregate).1
-            };
+            }?;
             stages.mark("packed_order_and_aggregate");
             output::write(
+                users_written,
                 &config.output,
                 &daily,
                 &catalog,
@@ -233,6 +237,7 @@ fn run(config: &Config) -> Result<()> {
     };
     stages.mark("sessions_and_attribution");
     output::write(
+        false,
         &config.output,
         &daily,
         &catalog,

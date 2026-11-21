@@ -1193,7 +1193,8 @@ impl Parsed {
         organic: usize,
         indexed: bool,
         stages: &mut Stages,
-    ) -> Vec<Daily<'static>> {
+        output: Option<&crate::output::BucketOutput>,
+    ) -> crate::Result<(Vec<Daily<'static>>, bool)> {
         let Self {
             events,
             clicks,
@@ -1204,7 +1205,12 @@ impl Parsed {
         } = self;
         let (events, links) = match (events, links) {
             (EventInput::Claims(batch), Aliases::Tokens(directory)) => {
-                return directory.aggregate(batch, clicks, base, first_day, days, organic, stages);
+                return Ok((
+                    directory.aggregate(
+                        batch, clicks, base, first_day, days, organic, stages, output,
+                    )?,
+                    output.is_some(),
+                ));
             }
             other => other,
         };
@@ -1262,7 +1268,7 @@ impl Parsed {
         );
         let clicks = transpose(clicks, count);
         stages.mark("packed_dedup_and_partition");
-        if indexed {
+        let daily = if indexed {
             let mode = std::env::var("SHOPPING_TIMELINES").unwrap_or_else(|_| "counted".into());
             coalesce(events, clicks)
                 .into_par_iter()
@@ -1310,7 +1316,8 @@ impl Parsed {
                     daily
                 })
                 .collect()
-        }
+        };
+        Ok((daily, false))
     }
 }
 
