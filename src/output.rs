@@ -16,6 +16,7 @@ use crate::catalog::Catalog;
 
 #[path = "output_pages.rs"]
 mod pages;
+pub(crate) use pages::BucketOutput;
 
 fn user_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -55,7 +56,7 @@ fn file_writer(
         .set_compression(compression)
         .set_max_row_group_row_count(Some(row_group));
     let mode = std::env::var("SHOPPING_WRITER").unwrap_or_default();
-    let properties = if matches!(mode.as_str(), "simple" | "pages") {
+    let properties = if matches!(mode.as_str(), "simple" | "pages" | "bucket") {
         properties
             .set_statistics_enabled(EnabledStatistics::None)
             .set_offset_index_disabled(true)
@@ -117,7 +118,7 @@ fn write_user_part(
     catalog: &Catalog<'_>,
     row_group: usize,
 ) -> Result<()> {
-    if std::env::var_os("SHOPPING_WRITER").is_some_and(|mode| mode == "pages")
+    if std::env::var_os("SHOPPING_WRITER").is_some_and(|mode| mode == "pages" || mode == "bucket")
         && pages::try_write(path, partitions, catalog, row_group)?
     {
         return Ok(());
@@ -208,6 +209,7 @@ fn write_campaigns(
 }
 
 pub fn write(
+    users_written: bool,
     output: &Path,
     partitions: &[Daily<'_>],
     catalog: &Catalog<'_>,
@@ -222,7 +224,11 @@ pub fn write(
     let (users, campaigns) = rayon::join(
         || {
             crate::stages::Stages::span(profile, "user_parquet", || {
-                write_users(&user_dir, partitions, catalog, workers, row_group)
+                if users_written && !partitions.is_empty() {
+                    Ok(())
+                } else {
+                    write_users(&user_dir, partitions, catalog, workers, row_group)
+                }
             })
         },
         || {

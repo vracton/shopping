@@ -3,7 +3,7 @@
 //! same schema used by the Arrow writer.
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parquet::arrow::{ARROW_SCHEMA_META_KEY, ArrowSchemaConverter, encode_arrow_schema};
@@ -14,7 +14,7 @@ use parquet::file::metadata::{
     RowGroupMetaData,
 };
 use parquet::file::writer::{SerializedPageWriter, TrackedWrite};
-use parquet::schema::types::ColumnDescPtr;
+use parquet::schema::types::{ColumnDescPtr, SchemaDescPtr};
 
 use crate::Result;
 use crate::aggregate::{Daily, UserDay, UserId};
@@ -58,13 +58,13 @@ fn write_deltas<const INT32: bool>(out: &mut Vec<u8>, values: &[i64]) {
             .chunks_exact(32)
             .enumerate()
         {
+            let chunk: &[i64; 32] = chunk.try_into().unwrap();
             let max = chunk.iter().max().unwrap().wrapping_sub(min) as u64;
             macro_rules! emit {
                 ($ty:ty) => {{
                     out[header + index] = <$ty>::BITS as u8;
-                    for &value in chunk {
-                        out.extend_from_slice(&(value.wrapping_sub(min) as $ty).to_le_bytes());
-                    }
+                    let bytes = chunk.map(|value| (value.wrapping_sub(min) as $ty).to_le_bytes());
+                    out.extend_from_slice(bytes.as_flattened());
                 }};
             }
             match max {
@@ -194,35 +194,103 @@ fn categories(rows: &[UserDay<'_>], catalog: &Catalog<'_>) -> Result<DataPage> {
     })
 }
 
+// If a category could exceed the physical page length limit, use Arrow's
+// regular page sizing. Packed identifiers have a bounded decoded length.
+fn row_group_size(catalog: &Catalog<'_>, requested: usize) -> Option<usize> {
+    let rows = requested.min(64 * 1024);
+    let max_category = catalog
+        .categories
+        .iter()
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(0);
+    (max_category.saturating_add(8).saturating_mul(rows) <= i32::MAX as usize).then_some(rows)
+}
+
+pub(crate) struct BucketOutput<'a> {
+    path: PathBuf,
+    catalog: &'a Catalog<'a>,
+    rows: usize,
+}
+
+impl<'a> BucketOutput<'a> {
+    pub(crate) fn prepare(
+        dir: &Path,
+        catalog: &'a Catalog<'a>,
+        requested: usize,
+    ) -> Result<Option<Self>> {
+        if !std::env::var_os("SHOPPING_WRITER").is_some_and(|s| s == "bucket") {
+            return Ok(None);
+        }
+        let Some(rows) = row_group_size(catalog, requested) else {
+            return Ok(None);
+        };
+        let path = dir.join("user_daily");
+        std::fs::create_dir_all(&path)?;
+        Ok(Some(Self {
+            path,
+            catalog,
+            rows,
+        }))
+    }
+
+    pub(crate) fn open(&self, index: usize) -> Result<PartWriter> {
+        PartWriter::open(&self.path.join(format!("part-{index}.parquet")))
+    }
+
+    pub(crate) fn append(&self, part: &mut PartWriter, rows: &[UserDay<'_>]) -> Result<()> {
+        for group in rows.chunks(self.rows) {
+            part.append(group, self.catalog)?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn try_write(
     path: &Path,
     parts: &[Daily<'_>],
     catalog: &Catalog<'_>,
     row_group: usize,
 ) -> Result<bool> {
-    let row_group = row_group.min(64 * 1024);
-    // Large arbitrary strings use the Arrow writer with its normal page sizing.
-    let max_category = catalog
-        .categories
+    let Some(row_group) = row_group_size(catalog, row_group) else {
+        return Ok(false);
+    };
+    if parts
         .iter()
-        .map(|v| v.len())
-        .max()
-        .unwrap_or(0);
-    if max_category.saturating_add(8).saturating_mul(row_group) > i32::MAX as usize
-        || parts
-            .iter()
-            .flat_map(|p| &p.users)
-            .any(|r| matches!(r.user, UserId::Bytes(_)))
+        .flat_map(|p| &p.users)
+        .any(|r| matches!(r.user, UserId::Bytes(_)))
     {
         return Ok(false);
     }
-    let arrow = super::user_schema();
-    let schema = Arc::new(ArrowSchemaConverter::new().convert(&arrow)?);
-    let mut dst = TrackedWrite::new(File::create(path)?);
-    dst.write_all(b"PAR1")?;
-    let mut groups = Vec::new();
-    let mut num_rows = 0;
+    let mut writer = PartWriter::open(path)?;
     for rows in parts.iter().flat_map(|p| p.users.chunks(row_group)) {
+        writer.append(rows, catalog)?;
+    }
+    writer.close()?;
+    Ok(true)
+}
+
+pub(crate) struct PartWriter {
+    dst: TrackedWrite<File>,
+    schema: SchemaDescPtr,
+    groups: Vec<RowGroupMetaData>,
+    num_rows: i64,
+}
+
+impl PartWriter {
+    fn open(path: &Path) -> Result<Self> {
+        let schema = Arc::new(ArrowSchemaConverter::new().convert(&super::user_schema())?);
+        let mut dst = TrackedWrite::new(File::create(path)?);
+        dst.write_all(b"PAR1")?;
+        Ok(Self {
+            dst,
+            schema,
+            groups: Vec::new(),
+            num_rows: 0,
+        })
+    }
+
+    fn append(&mut self, rows: &[UserDay<'_>], catalog: &Catalog<'_>) -> Result<()> {
         let pages = [
             identifiers(rows),
             integers::<true>(rows, |r| i64::from(r.day)),
@@ -233,40 +301,48 @@ pub(super) fn try_write(
         ];
         let mut columns = Vec::with_capacity(pages.len());
         for (index, page) in pages.into_iter().enumerate() {
-            columns.push(page.write(&mut dst, schema.column(index), rows.len() as u32)?);
+            columns.push(page.write(
+                &mut self.dst,
+                self.schema.column(index),
+                rows.len() as u32,
+            )?);
         }
         let bytes = columns
             .iter()
             .map(|column| column.uncompressed_size())
             .sum();
-        groups.push(
-            RowGroupMetaData::builder(Arc::clone(&schema))
+        self.groups.push(
+            RowGroupMetaData::builder(Arc::clone(&self.schema))
                 .set_column_metadata(columns)
                 .set_num_rows(rows.len() as i64)
                 .set_total_byte_size(bytes)
                 .build()?,
         );
-        num_rows += rows.len() as i64;
+        self.num_rows += rows.len() as i64;
+        Ok(())
     }
-    let kv = KeyValue::new(
-        ARROW_SCHEMA_META_KEY.to_string(),
-        encode_arrow_schema(&arrow),
-    );
-    let file = FileMetaData::new(
-        2,
-        num_rows,
-        Some("shopping-sessions".into()),
-        Some(vec![kv]),
-        schema,
-        None,
-    );
-    // No page indexes: all page locations in the footer are already absolute.
-    let metadata = ParquetMetaData::new(file, groups);
-    let mut footer = Vec::new();
-    ParquetMetaDataWriter::new(&mut footer, &metadata).finish()?;
-    dst.write_all(&footer)?;
-    dst.flush()?;
-    Ok(true)
+
+    pub(crate) fn close(mut self) -> Result<()> {
+        let kv = KeyValue::new(
+            ARROW_SCHEMA_META_KEY.to_string(),
+            encode_arrow_schema(&super::user_schema()),
+        );
+        let file = FileMetaData::new(
+            2,
+            self.num_rows,
+            Some("shopping-sessions".into()),
+            Some(vec![kv]),
+            self.schema,
+            None,
+        );
+        // No page indexes: all page locations in the footer are already absolute.
+        let metadata = ParquetMetaData::new(file, self.groups);
+        let mut footer = Vec::new();
+        ParquetMetaDataWriter::new(&mut footer, &metadata).finish()?;
+        self.dst.write_all(&footer)?;
+        self.dst.flush()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
