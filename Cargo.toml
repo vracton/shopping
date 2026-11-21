@@ -4,5 +4,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 
+[dependencies]
+arrow-array = "58.4"
+arrow-schema = "58.4"
+memchr = "2.8"
+memmap2 = "0.9"
+parquet = { version = "58.4", default-features = false, features = ["arrow", "snap"] }
+rayon = "1.11"
+rustc-hash = "2.1"
+serde_json = "1"
+
 [profile.release]
 panic = "abort"
