@@ -985,6 +985,7 @@ fn aggregate_sorted(
 
 enum EventInput {
     Claims(claims::ClaimBatch),
+    LocalClaims(claims::LocalClaims),
     ById(Vec<Vec<Vec<Candidate>>>),
     ByPerson(split::SplitEvents),
 }
@@ -1109,6 +1110,17 @@ pub fn parse_inputs(
                                 && std::env::var_os("SHOPPING_DEDUP_MODE")
                                     .is_some_and(|m| m == "claims")
                             {
+                                if std::env::var_os("SHOPPING_CLAIMS")
+                                    .is_some_and(|mode| mode == "local")
+                                {
+                                    return claims::LocalClaims::parse(
+                                        events,
+                                        dedup_count,
+                                        &parser,
+                                        window_rows,
+                                    )
+                                    .map(EventInput::LocalClaims);
+                                }
                                 return claims::ClaimBatch::parse(
                                     events,
                                     dedup_count,
@@ -1174,6 +1186,7 @@ impl Parsed {
             || {
                 Stages::span(profile, "event_dedup_and_route", || match events {
                     EventInput::Claims(batch) => batch.route(&links, count),
+                    EventInput::LocalClaims(batch) => batch.route(&links, count),
                     EventInput::ByPerson(routed) => routed.winners(count, profile),
                     EventInput::ById(groups) => {
                         let parts = groups
