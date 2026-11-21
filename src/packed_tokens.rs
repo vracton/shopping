@@ -257,12 +257,27 @@ impl Directory {
                 }
             }
         }
-        let parts = parts
+        let mut parts: Vec<_> = parts
             .into_iter()
             .filter(|p| !p.events.is_empty())
             .map(|p| (p.weight, p))
             .collect();
-        let jobs = balance(parts);
+        let queue_enabled = std::env::var_os("SHOPPING_WORK_QUEUE").is_some();
+        let mut backlog = Vec::new();
+        let jobs = if queue_enabled {
+            let n = rayon::current_num_threads().min(parts.len());
+            parts.sort_unstable_by_key(|p| p.0);
+            backlog = parts.into_iter().map(|(_, part)| part).collect();
+            (0..n)
+                .map(|_| Job {
+                    buckets: Vec::new(),
+                    weight: 0,
+                })
+                .collect()
+        } else {
+            balance(parts)
+        };
+        let backlog = std::sync::Mutex::new(backlog);
         stages.mark("packed_dedup_and_partition");
         jobs.into_par_iter()
             .enumerate()
@@ -291,7 +306,14 @@ impl Directory {
                 let mut cursors = Vec::new();
                 let mut column_cursors = Vec::new();
                 let mut times = Vec::new();
-                for part in job.buckets {
+                let work = std::iter::from_fn(|| {
+                    if queue_enabled {
+                        backlog.lock().unwrap().pop()
+                    } else {
+                        None
+                    }
+                });
+                for part in job.buckets.into_iter().chain(work) {
                     let span = 1 << self.shift;
                     let keys = &self.keys[part.index * span..(part.index + 1) * span];
                     if columns {
