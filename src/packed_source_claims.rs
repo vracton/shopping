@@ -159,6 +159,7 @@ impl SourceEvents {
     }
 
     pub(super) fn route(self, links: &Aliases, count: usize) -> Vec<Vec<Vec<Event>>> {
+        let router = claim_aliases::Router::new(links);
         let parts = self
             .0
             .into_par_iter()
@@ -181,7 +182,11 @@ impl SourceEvents {
                         }
                     })
                 });
-                route(candidates, links, &mut output);
+                if let Some(router) = &router {
+                    router.route(candidates, &mut output)
+                } else {
+                    route(candidates, links, &mut output)
+                }
                 output
             })
             .collect();

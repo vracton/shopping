@@ -5,6 +5,11 @@ use super::{Key, RowWindows};
 pub(super) struct Sparse(Vec<(Key, Key)>);
 
 impl Sparse {
+    // Empty sparse slots have Key(0), which is outside the packed ID domain.
+    pub(super) fn keys(&self) -> impl ExactSizeIterator<Item = Key> + '_ {
+        self.0.iter().map(|&(key, _)| key)
+    }
+
     #[inline]
     pub(super) fn prefetch(&self, key: Key) {
         #[cfg(target_arch = "x86_64")]

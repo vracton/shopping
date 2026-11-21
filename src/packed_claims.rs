@@ -106,6 +106,7 @@ impl ClaimBatch {
         };
         mark_claims(claims, lookup, reject);
         drop(metadata);
+        let router = claim_aliases::Router::new(links);
         let parts = events
             .into_par_iter()
             .map(|rows| {
@@ -118,7 +119,11 @@ impl ClaimBatch {
                     purchase: row.purchase,
                     ..Candidate::default()
                 });
-                route(candidates, links, &mut output);
+                if let Some(router) = &router {
+                    router.route(candidates, &mut output)
+                } else {
+                    route(candidates, links, &mut output)
+                }
                 output
             })
             .collect();

@@ -15,6 +15,8 @@ mod sparse_links;
 #[path = "packed_route.rs"]
 mod split;
 
+#[path = "packed_claim_aliases.rs"]
+mod claim_aliases;
 #[path = "packed_claims.rs"]
 mod claims;
 #[path = "packed_source_claims.rs"]
