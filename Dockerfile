@@ -1,5 +1,5 @@
-ARG SHOPPING_WRITER=simple
-ARG SHOPPING_CLAIMS=off
+ARG SHOPPING_WRITER=pages
+ARG SHOPPING_CLAIMS=screen
 FROM rust:1.94-bookworm AS build
 WORKDIR /app
 RUN rustup component add llvm-tools-preview
