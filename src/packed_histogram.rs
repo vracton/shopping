@@ -165,3 +165,77 @@ impl Timelines {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undersampled_shopper_and_full_key_collision_keep_all_events_and_clicks() {
+        const ROWS: usize = 4096;
+        let slots = (ROWS / 6).next_power_of_two();
+        let key = |i| Key::pack(format!("k{i:07}").as_bytes()).unwrap();
+        let slot = |k: Key| k.hash() as usize & (slots - 1);
+        let sampled = key(0);
+        let skew = (1..50000)
+            .map(key)
+            .find(|&k| slot(k) != slot(sampled))
+            .unwrap();
+        let collision = (1..50000)
+            .map(key)
+            .find(|&k| k != skew && slot(k) == slot(skew))
+            .unwrap();
+        let batch = || {
+            let events = (0..ROWS)
+                .map(|i| Event {
+                    user: if i % 8 == 0 {
+                        sampled
+                    } else if i % 19 == 0 {
+                        collision
+                    } else {
+                        skew
+                    },
+                    ts: (i as u32 % 512) * 1_900_000,
+                    purchase: ((i % 9) as u32) << 24 | 37,
+                })
+                .collect();
+            let clicks = [skew, collision, sampled, skew]
+                .into_iter()
+                .enumerate()
+                .map(|(i, user)| Click {
+                    user,
+                    id: key(i as i32 + 1),
+                    ts: 1_900_000,
+                    campaign: i as u32,
+                })
+                .collect();
+            (vec![events], vec![clicks])
+        };
+        let mut expected = Daily::default();
+        aggregate_sorted(batch(), 4, 0, &mut expected);
+        let mut actual = Daily::default();
+        Timelines::default().run::<true>(
+            batch(),
+            4,
+            0,
+            &mut actual,
+            &mut CountedTimelines::default(),
+        );
+        let rows = |daily: &Daily| {
+            let mut rows: Vec<_> = daily
+                .users
+                .iter()
+                .map(|r| {
+                    let UserId::Packed(key) = r.user else {
+                        unreachable!()
+                    };
+                    (key, r.day, r.events, r.sessions, r.revenue, r.top_category)
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(rows(&actual), rows(&expected));
+        assert_eq!(actual.campaigns, expected.campaigns);
+    }
+}
