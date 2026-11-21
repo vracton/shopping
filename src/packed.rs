@@ -21,6 +21,9 @@ mod claims;
 #[path = "packed_pages.rs"]
 mod pages;
 
+#[path = "packed_histogram.rs"]
+mod histogram;
+
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
 
@@ -1244,8 +1247,12 @@ impl Parsed {
                         ..CountedTimelines::default()
                     };
                     let mut pages = pages::Timelines::default();
+                    let mut histogram = histogram::Timelines::default();
                     for pair in job.buckets {
                         match mode.as_str() {
+                            "histogram" => {
+                                histogram.run(pair, organic, base, &mut daily, &mut counted)
+                            }
                             "pages" => pages.run(pair, organic, base, &mut daily, &mut counted),
                             "linked" => grouping.run(pair, organic, base, &mut daily),
                             "sort" => aggregate_sorted(pair, organic, base, &mut daily),
