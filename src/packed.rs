@@ -20,6 +20,8 @@ mod claims;
 #[path = "packed_clicks.rs"]
 mod click_routing;
 use click_routing::ClickInput;
+#[path = "shopper_slots.rs"]
+mod shopper_slots;
 
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
@@ -156,6 +158,7 @@ enum Aliases {
     Serial(Links),
     Sharded(Vec<FxHashMap<Key, Key>>),
     Sparse(sparse_links::Sparse),
+    Slots(shopper_slots::Directory),
 }
 
 impl Aliases {
@@ -163,6 +166,7 @@ impl Aliases {
         match self {
             Self::Serial(links) => links.resolve(key),
             Self::Sparse(links) => links.resolve(key),
+            Self::Slots(dir) => dir.name(dir.intern(key)),
             Self::Sharded(parts) => parts[bucket(key, parts.len())]
                 .get(&key)
                 .copied()
@@ -656,6 +660,9 @@ fn route_groups(groups: Vec<Vec<Candidate>>, links: &Aliases, output: &mut [Vec<
 }
 
 fn route(rows: impl Iterator<Item = Candidate>, links: &Aliases, output: &mut [Vec<Event>]) {
+    if let Aliases::Slots(dir) = links {
+        return dir.route(rows, output);
+    }
     if let Aliases::Sparse(table) = links
         && std::env::var_os("SHOPPING_ALIAS_ROUTE").is_some_and(|v| v == "batch")
     {
@@ -1089,8 +1096,31 @@ pub fn parse_inputs(
                     == Some(std::ffi::OsStr::new("sparse"))
             {
                 sparse_links::Sparse::new(link_chunks).map(Aliases::Sparse)
-            } else if indexed && std::env::var_os("SHOPPING_LINKS").is_some_and(|s| s == "concurrent") {
+            } else if indexed
+                && std::env::var_os("SHOPPING_LINKS").is_some_and(|s| s == "concurrent")
+            {
                 sparse_links::Sparse::concurrent(link_chunks).map(Aliases::Sparse)
+            } else if indexed
+                && std::env::var_os("SHOPPING_LINKS").is_some_and(|s| s == "slots" || s == "direct")
+            {
+                if std::env::var_os("SHOPPING_DEDUP_MODE").is_some_and(|s| s == "claims")
+                    && std::env::var_os("SHOPPING_ROUTE").is_none_or(|s| s != "split")
+                    && std::env::var_os("SHOPPING_TIMELINES").is_none_or(|s| s == "counted")
+                {
+                    if std::env::var_os("SHOPPING_LINKS").is_some_and(|s| s == "direct") {
+                        if let Some(directory) = shopper_slots::Directory::direct(link_chunks) {
+                            return Some(Aliases::Slots(directory));
+                        }
+                        if profile {
+                            eprintln!("direct shopper directory fell back to sparse links");
+                        }
+                        return sparse_links::Sparse::new(link_chunks).map(Aliases::Sparse);
+                    }
+                    sparse_links::Sparse::new(link_chunks)
+                        .map(|s| Aliases::Slots(shopper_slots::Directory::new(s)))
+                } else {
+                    sparse_links::Sparse::new(link_chunks).map(Aliases::Sparse)
+                }
             } else if indexed
                 && std::env::var_os("SHOPPING_LINKS").as_deref()
                     == Some(std::ffi::OsStr::new("parallel"))
@@ -1109,14 +1139,21 @@ pub fn parse_inputs(
         let events = Stages::span(profile, "split_decode", || {
             split::decode(events, &parser, &links, count, dedup_count, window_rows)
         })?;
-        (EventInput::ByPerson(events), ClickInput::ByChunk(clicks?), links)
-    } else if indexed && std::env::var_os("SHOPPING_CLICK_ROUTE").is_some_and(|s| s == "parse")
+        (
+            EventInput::ByPerson(events),
+            ClickInput::ByChunk(clicks?),
+            links,
+        )
+    } else if indexed
+        && std::env::var_os("SHOPPING_CLICK_ROUTE").is_some_and(|s| s == "parse")
         && std::env::var_os("SHOPPING_DEDUP_MODE").is_some_and(|s| s == "claims")
     {
         let (events, routed) = rayon::join(
-            || Stages::span(profile, "event_decode_and_scatter", || {
-                claims::ClaimBatch::parse(events, dedup_count, &parser, window_rows)
-            }),
+            || {
+                Stages::span(profile, "event_decode_and_scatter", || {
+                    claims::ClaimBatch::parse(events, dedup_count, &parser, window_rows)
+                })
+            },
             || {
                 let links = decode_links()?;
                 let clicks = Stages::span(profile, "click_decode_and_route", || {
@@ -1222,6 +1259,10 @@ impl Parsed {
                         .into_par_iter()
                         .map(|group| {
                             let mut output = buckets(count);
+                            if let Aliases::Slots(dir) = &links {
+                                dir.route_clicks(&group, &mut output);
+                                return output;
+                            }
                             if let Aliases::Sparse(table) = &links {
                                 for block in group.chunks(24) {
                                     for row in block {
@@ -1272,6 +1313,18 @@ impl Parsed {
                         ..CountedTimelines::default()
                     };
                     for pair in job.buckets {
+                        if let Aliases::Slots(dir) = &links {
+                            shopper_slots::group(
+                                dir,
+                                count,
+                                &mut counted,
+                                pair,
+                                organic,
+                                base,
+                                &mut daily,
+                            );
+                            continue;
+                        }
                         match mode.as_str() {
                             "linked" => grouping.run(pair, organic, base, &mut daily),
                             "sort" => aggregate_sorted(pair, organic, base, &mut daily),

@@ -2,7 +2,7 @@ use super::{Candidate, Event, INVALID, Key, RowWindows, bucket};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-fn table_size(chunks: &[&[u8]]) -> Option<(usize, usize)> {
+pub(super) fn table_size(chunks: &[&[u8]]) -> Option<(usize, usize)> {
     let rows: usize = chunks
         .iter()
         .map(|chunk| {
@@ -102,6 +102,9 @@ impl Concurrent {
 pub(super) struct Sparse(Vec<(Key, Key)>);
 
 impl Sparse {
+    pub(super) fn into_pairs(self) -> Vec<(Key, Key)> {
+        self.0
+    }
     pub(super) fn route_batched(
         &self,
         rows: impl Iterator<Item = Candidate>,

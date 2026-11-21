@@ -7,6 +7,9 @@ pub(super) enum ClickInput {
 
 /// Resolve a small block together so independent hash probes overlap.
 fn scatter(block: &[Click], links: &Aliases, output: &mut [Vec<Click>]) {
+    if let Aliases::Slots(dir) = links {
+        return dir.route_clicks(block, output);
+    }
     if let Aliases::Sparse(table) = links {
         for row in block {
             table.prefetch(row.user);
