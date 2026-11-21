@@ -1,0 +1,226 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 09af4fc22a984b5752d47a6285f1f08a0bc84e9c..d382b509177f9e0226221d85db04c9b4a2858f68 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -619,6 +619,7 @@ dependencies = [
+  "parquet",
+  "rayon",
+  "rustc-hash",
++ "rustversion",
+  "serde_json",
+ ]
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 89e5c4e905f7e39c2788cfb34960d792e722a16a..f66abc7056e6c5a1ef4112f950cf869a5f3f676c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -15,5 +15,8 @@ rayon = "1.11"
+ rustc-hash = "2.1"
+ serde_json = "1"
+
++[target.'cfg(target_arch = "x86_64")'.dependencies]
++rustversion = "1.0.22"
++
+ [profile.release]
+ panic = "abort"
+diff --git a/src/input.rs b/src/input.rs
+index 3cf7f4a19eb23db14bb5bcc29ccaefbfc9c75092..55a9c8c8d242a97743c4d805e7a2af50787b8cc2 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -535,6 +535,30 @@ impl Calendar {
+ #[path = "split_fields.rs"]
+ mod split_fields;
+
++#[cfg(all(
++    target_arch = "x86_64",
++    target_feature = "avx2",
++    target_feature = "bmi2"
++))]
++pub(crate) use split_fields::visit_windows;
++#[cfg(not(all(
++    target_arch = "x86_64",
++    target_feature = "avx2",
++    target_feature = "bmi2"
++)))]
++pub(crate) use visit_narrow as visit_windows;
++
++#[inline(always)]
++pub(crate) fn visit_narrow<'a, const N: usize>(
++    bytes: &'a [u8],
++    emit: &mut impl FnMut([&'a [u8]; N]) -> Option<()>,
++) -> Option<()> {
++    for row in RowWindows::new(bytes) {
++        emit(row)?;
++    }
++    Some(())
++}
++
+ /// A row-oriented scanner that extracts every field boundary from two masks.
+ /// Fixed-width loads are only used when the complete load is inside the shard.
+ pub struct RowWindows<'a, const N: usize> {
+diff --git a/src/packed.rs b/src/packed.rs
+index 6ac72da1fa58da8da60cc1ad3d726a89140216c8..ab5f891f6542c947ed31b1c701fe7ef61ef9a56d 100644
+--- a/src/packed.rs
++++ b/src/packed.rs
+@@ -1094,9 +1094,7 @@ pub fn parse_inputs(
+                         Some(())
+                     };
+                     if window_rows {
+-                        for row in RowWindows::new(chunk) {
+-                            push(row)?;
+-                        }
++                        crate::input::visit_windows(chunk, &mut push)?;
+                     } else {
+                         for row in ChunkRows::new(chunk) {
+                             push(row)?;
+diff --git a/src/packed_claims.rs b/src/packed_claims.rs
+index 3b7639b129e1026d5d8ccdc455ba312ee6dee569..b31c4fca426f663bb58876a723b074cac7044e3a 100644
+--- a/src/packed_claims.rs
++++ b/src/packed_claims.rs
+@@ -123,9 +123,7 @@ impl ClaimBatch {
+                 };
+                 for chunk in chunks {
+                     if windows {
+-                        for row in RowWindows::new(chunk) {
+-                            emit(row)?;
+-                        }
++                        crate::input::visit_windows(chunk, &mut emit)?;
+                     } else {
+                         for row in ChunkRows::new(chunk) {
+                             emit(row)?;
+diff --git a/src/split_fields.rs b/src/split_fields.rs
+index b2cf7ab5787761098a51ea9a79c2d6b54c662920..c760d594ddd48b02090e7e9d0080f5079b2dc142 100644
+--- a/src/split_fields.rs
++++ b/src/split_fields.rs
+@@ -2,6 +2,16 @@
+ //! SIMD vector contains the two IDs. All other layouts use the general scanner.
+ use std::arch::x86_64::*;
+
++// Rust 1.89 stabilized the AVX-512 target features and intrinsics.
++#[rustversion::since(1.89)]
++mod isa_wide {
++    include!("isa_wide.rs");
++}
++#[rustversion::before(1.89)]
++pub(crate) use super::visit_narrow as visit_windows;
++#[rustversion::since(1.89)]
++pub(crate) use isa_wide::visit_windows;
++
+ struct Masks {
+     commas: u32,
+     quotes: u32,
+@@ -40,20 +50,54 @@ pub(super) fn event<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
+             masks(data.as_ptr().add(64)),
+         )
+     };
++    // The masks below were loaded from these exact bytes.
++    unsafe {
++        event_masks(
++            data,
++            first,
++            join(middle.newlines, last.newlines),
++            join(middle.commas, last.commas),
++            join(middle.quotes, last.quotes),
++            suffix_ranks,
++        )
++    }
++}
++
++#[inline(always)]
++fn suffix_ranks(separators: u64, inside: u64) -> [usize; 4] {
++    let time_end = 32 + separators.trailing_zeros() as usize;
++    let ingest_end = 32 + (separators & (separators - 1)).trailing_zeros() as usize;
++    let before_last = separators & inside;
++    let product_end = 95 - before_last.leading_zeros() as usize;
++    let kind_end = unsafe { 32 + _pdep_u64(4, separators).trailing_zeros() as usize };
++    [time_end, ingest_end, kind_end, product_end]
++}
++
++// The caller supplies masks of data[0..32] and data[32..96], and ranks
++// returns the four comma positions in the latter window in ascending order.
++#[inline(always)]
++unsafe fn event_masks<const N: usize>(
++    data: &[u8],
++    first: Masks,
++    lf: u64,
++    commas: u64,
++    quote_mask: u64,
++    ranks: impl FnOnce(u64, u64) -> [usize; 4],
++) -> Option<(usize, Option<[&[u8]; N]>)> {
++    debug_assert_eq!(N, 7);
+     if first.newlines != 0 || first.commas.count_ones() != 2 || first.commas >> 31 != 0 {
+         return None;
+     }
+-    let lf = join(middle.newlines, last.newlines);
+     if lf == 0 {
+         return None;
+     }
+     let end = 32 + lf.trailing_zeros() as usize;
+     let inside = !lf & lf.wrapping_sub(1);
+-    let separators = (join(middle.commas, last.commas) & inside) | (lf & lf.wrapping_neg());
++    let separators = (commas & inside) | (lf & lf.wrapping_neg());
+     if separators.count_ones() != 5 {
+         return Some((end, None));
+     }
+-    let quotes = join(middle.quotes, last.quotes) & inside;
++    let quotes = quote_mask & inside;
+     // An opening quote adds a carry through the field's non-separator
+     // bits. Each carry stops at exactly that field's next delimiter.
+     // All remaining quotes must be immediately before those delimiters.
+@@ -73,11 +117,7 @@ pub(super) fn event<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
+     // remaining commas can be selected without waiting for the IDs' cuts.
+     let id_end = first.commas.trailing_zeros() as usize;
+     let user_end = 31 - first.commas.leading_zeros() as usize;
+-    let time_end = 32 + separators.trailing_zeros() as usize;
+-    let ingest_end = 32 + (separators & (separators - 1)).trailing_zeros() as usize;
+-    let before_last = separators & inside;
+-    let product_end = 95 - before_last.leading_zeros() as usize;
+-    let kind_end = unsafe { 32 + _pdep_u64(4, separators).trailing_zeros() as usize };
++    let [time_end, ingest_end, kind_end, product_end] = ranks(separators, inside);
+     let cuts = [
+         0,
+         id_end + 1,
+@@ -102,21 +142,39 @@ pub(super) fn event<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
+ #[inline(always)]
+ pub(super) fn short<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]; N]>)> {
+     let data = data.get(..64)?;
+-    let expected_commas = N.checked_sub(1)?;
+     let (first, second) = unsafe { (masks(data.as_ptr()), masks(data.as_ptr().add(32))) };
+-    let lf = join(first.newlines, second.newlines);
++    // The masks below were loaded from these exact bytes.
++    unsafe {
++        short_masks(
++            data,
++            join(first.newlines, second.newlines),
++            join(first.commas, second.commas),
++            join(first.quotes, second.quotes),
++        )
++    }
++}
++
++// The caller supplies the newline, comma and quote masks of data[0..64].
++#[inline(always)]
++unsafe fn short_masks<const N: usize>(
++    data: &[u8],
++    lf: u64,
++    comma_mask: u64,
++    quote_mask: u64,
++) -> Option<(usize, Option<[&[u8]; N]>)> {
++    let expected_commas = N.checked_sub(1)?;
+     if lf == 0 {
+         return None;
+     }
+     let end = lf.trailing_zeros() as usize;
+     let inside = !lf & lf.wrapping_sub(1);
+-    let mut commas = join(first.commas, second.commas) & inside;
++    let mut commas = comma_mask & inside;
+     if end == 0 || commas.count_ones() as usize != expected_commas {
+         return Some((end, None));
+     }
+     let boundaries = commas | (lf & lf.wrapping_neg());
+     let starts = commas << 1 | 1;
+-    let quotes = join(first.quotes, second.quotes) & inside;
++    let quotes = quote_mask & inside;
+     let opened = quotes & starts;
+     if (quotes ^ opened) << 1 != ((!boundaries).wrapping_add(opened) & boundaries) {
+         return Some((end, None));

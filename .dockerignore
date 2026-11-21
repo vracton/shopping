@@ -9,3 +9,7 @@
 !generator/generator/Cargo.lock
 !generator/generator/src/
 !generator/generator/src/**
+!wide/
+!wide/launch.rs
+!wide/scanner.patch
+!wide/isa_wide.rs
