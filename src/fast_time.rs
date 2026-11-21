@@ -159,15 +159,7 @@ impl FastTime {
             }
         }
         match bytes.len() {
-            13 => {
-                let head = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                let tail = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
-                Some(
-                    (decimal_eight(head)? * 100_000
-                        + decimal_eight((tail & !0xff_ffff) | 0x30_3030)?)
-                        as i64,
-                )
-            }
+            13 => decimal_epoch(bytes),
             20 if bytes[10] == b'T' && bytes[19] == b'Z' => {
                 let prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
                 let day = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
@@ -237,6 +229,47 @@ unsafe fn month_seconds(bytes: &[u8], days: i16) -> Option<i32> {
     }
 }
 
+#[inline(always)]
+fn decimal_epoch(bytes: &[u8]) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    {
+        use std::arch::x86_64::*;
+        let bytes: &[u8; 13] = bytes.try_into().ok()?;
+        // The two eight-byte reads overlap within the thirteen input digits.
+        unsafe {
+            let raw = _mm_unpacklo_epi64(
+                _mm_loadl_epi64(bytes.as_ptr().cast()),
+                _mm_loadl_epi64(bytes.as_ptr().add(5).cast()),
+            );
+            let digits = _mm_sub_epi8(raw, _mm_set1_epi8(b'0' as i8));
+            let bad = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+            if _mm_testz_si128(bad, bad) == 0 {
+                return None;
+            }
+            let digits = _mm_shuffle_epi8(
+                digits,
+                _mm_setr_epi8(-1, -1, -1, 0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15),
+            );
+            let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+            let groups = _mm_madd_epi16(pairs, _mm_set1_epi32(0x10064));
+            let halves = _mm_madd_epi16(_mm_packs_epi32(groups, groups), _mm_set1_epi32(0x12710));
+            Some(
+                i64::from(_mm_cvtsi128_si32(halves)) * 100_000_000
+                    + i64::from(_mm_extract_epi32::<1>(halves)),
+            )
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+    {
+        let head = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let tail = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
+        Some(
+            (decimal_eight(head)? * 100_000 + decimal_eight((tail & !0xff_ffff) | 0x30_3030)?)
+                as i64,
+        )
+    }
+}
+
 fn bcd(mut n: u64, digits: u32) -> u64 {
     let mut result = 0;
     for i in 0..digits {
@@ -294,6 +327,7 @@ fn ascii_digits(word: u64, lanes: u64) -> bool {
     (high | overflow) & lanes == 0
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
 #[inline(always)]
 fn decimal_eight(word: u64) -> Option<u64> {
     if !ascii_digits(word, u64::MAX) {

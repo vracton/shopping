@@ -1,4 +1,4 @@
-ARG SHOPPING_WRITER=pages
+ARG SHOPPING_WRITER=bucket
 ARG SHOPPING_CLAIMS=screen
 FROM rust:1.94-bookworm AS build
 WORKDIR /app
@@ -21,6 +21,7 @@ RUN set -eu; \
         DATA_DIR="/tmp/input-$seed" OUTPUT_DIR=/tmp/output NCPU=8 \
         SHOPPING_ARCH=indexed SHOPPING_DEDUP_MODE="$mode" SHOPPING_LINKS=sparse \
         SHOPPING_ASSISTS=sweep SHOPPING_TIMELINES=tokens SHOPPING_SESSIONIZER=columns \
+        SHOPPING_CLAIMS="$SHOPPING_CLAIMS" SHOPPING_WRITER="$SHOPPING_WRITER" SHOPPING_EXIT=unmap \
         LLVM_PROFILE_FILE=/tmp/profile/%p-%m.profraw target/release/shopping-sessions; \
       done; \
     done; \
@@ -36,7 +37,7 @@ COPY --from=build /app/target/release/shopping-sessions /usr/local/bin/shopping-
 ENV LD_PRELOAD=libjemalloc.so.2 \
     MALLOC_CONF=thp:always,metadata_thp:always,dirty_decay_ms:-1,muzzy_decay_ms:-1 \
     SHOPPING_ARCH=indexed SHOPPING_DEDUP_MODE=claims SHOPPING_DEDUP_PARTITIONS=128 \
-    SHOPPING_LINKS=sparse SHOPPING_ASSISTS=sweep SHOPPING_EXIT=kernel \
+    SHOPPING_LINKS=sparse SHOPPING_ASSISTS=sweep SHOPPING_EXIT=unmap \
     SHOPPING_TIMELINES=tokens SHOPPING_SESSIONIZER=columns \
     SHOPPING_WRITER=${SHOPPING_WRITER} SHOPPING_CLAIMS=${SHOPPING_CLAIMS}
 USER 1000:1000

@@ -54,26 +54,21 @@ pub(super) fn event<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
         return Some((end, None));
     }
     let quotes = join(middle.quotes, last.quotes) & inside;
-    // Each quote must touch exactly one end of its field. The high word
-    // starts inside field 3, so three opening bits and two closing bits
-    // precede it. A quote at byte 31 can close at the first high separator.
-    let starts1 = first.commas << 1 | 1;
-    let ends1 = first.commas >> 1 | (separators as u32) << 31;
-    let starts2 = separators << 1;
-    if first.quotes & !(starts1 ^ ends1) != 0 || quotes & !(starts2 ^ (separators >> 1)) != 0 {
+    // An opening quote adds a carry through the field's non-separator
+    // bits. Each carry stops at exactly that field's next delimiter.
+    // All remaining quotes must be immediately before those delimiters.
+    let bounds = u128::from(first.commas) | (u128::from(separators) << 32);
+    let quoted = u128::from(first.quotes) | (u128::from(quotes) << 32);
+    let starts = bounds << 1 | 1;
+    let opened = quoted & starts;
+    let closes = quoted ^ opened;
+    if closes << 1 != ((!bounds).wrapping_add(opened) & bounds) {
         return Some((end, None));
     }
-    let (open, close) = unsafe {
-        (
-            _pext_u32(first.quotes, starts1) | ((_pext_u64(quotes, starts2) as u32) << 3),
-            _pext_u32(first.quotes << 1, first.commas)
-                | ((_pext_u64(quotes << 1 | u64::from(first.quotes >> 31), separators) as u32)
-                    << 2),
-        )
+    let open = unsafe {
+        _pext_u32(first.quotes, starts as u32)
+            | ((_pext_u64(quotes, (starts >> 32) as u64) as u32) << 3)
     };
-    if open != close {
-        return Some((end, None));
-    }
     // Two ID boundaries are at opposite ends of a 32-bit mask. The four
     // remaining commas can be selected without waiting for the IDs' cuts.
     let id_end = first.commas.trailing_zeros() as usize;
@@ -122,12 +117,11 @@ pub(super) fn short<const N: usize>(data: &[u8]) -> Option<(usize, Option<[&[u8]
     let boundaries = commas | (lf & lf.wrapping_neg());
     let starts = commas << 1 | 1;
     let quotes = join(first.quotes, second.quotes) & inside;
-    let open = unsafe { _pext_u64(quotes, starts) };
-    if quotes & !(starts ^ (boundaries >> 1)) != 0
-        || open != unsafe { _pext_u64(quotes << 1, boundaries) }
-    {
+    let opened = quotes & starts;
+    if (quotes ^ opened) << 1 != ((!boundaries).wrapping_add(opened) & boundaries) {
         return Some((end, None));
     }
+    let open = unsafe { _pext_u64(opened, starts) };
     let mut start = 0;
     Some((
         end,

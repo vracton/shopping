@@ -1,11 +1,14 @@
 use rustc_hash::FxHashMap;
 
+#[path = "catalog_bits.rs"]
+mod bits;
+
 use crate::input::{data_rows, fields};
 
 pub struct Catalog<'a> {
     users: FxHashMap<&'a [u8], &'a [u8]>,
-    products: FxHashMap<&'a [u8], usize>,
-    campaigns_by_id: FxHashMap<&'a [u8], usize>,
+    products: bits::Index<'a>,
+    campaigns_by_id: bits::Index<'a>,
     pub categories: Vec<&'a [u8]>,
     pub campaigns: Vec<Campaign<'a>>,
     pub organic: usize,
@@ -30,19 +33,21 @@ impl<'a> Catalog<'a> {
         categories.sort_unstable();
         categories.dedup();
         let unknown = categories.binary_search(&&b"unknown"[..]).unwrap();
-        let products = product_rows
+        let products: Vec<_> = product_rows
             .into_iter()
             .map(|[id, category]| (id, categories.binary_search(&category).unwrap()))
             .collect();
+        let products = bits::Index::new(products.iter().copied());
         let mut campaigns: Vec<_> = data_rows(campaigns)
             .filter_map(fields::<2>)
             .map(|[id, channel]| Campaign { id, channel })
             .collect();
-        let campaigns_by_id = campaigns
-            .iter()
-            .enumerate()
-            .map(|(index, row)| (row.id, index))
-            .collect();
+        let campaigns_by_id = bits::Index::new(
+            campaigns
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id, index)),
+        );
         let organic = campaigns.len();
         campaigns.push(Campaign {
             id: b"organic",
@@ -64,11 +69,11 @@ impl<'a> Catalog<'a> {
     }
 
     pub fn category(&self, product: &[u8]) -> usize {
-        self.products.get(product).copied().unwrap_or(self.unknown)
+        self.products.get(product).unwrap_or(self.unknown)
     }
 
     pub fn campaign(&self, id: &[u8]) -> Option<usize> {
-        self.campaigns_by_id.get(id).copied()
+        self.campaigns_by_id.get(id)
     }
 }
 
