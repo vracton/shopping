@@ -79,16 +79,8 @@ impl FastTime {
     #[inline(always)]
     pub fn timestamp(&self, bytes: &[u8], calendar: &Calendar) -> Option<i64> {
         match bytes.len() {
-            13 => {
-                let head = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                let tail = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
-                Some(
-                    (decimal_eight(head)? * 100_000
-                        + decimal_eight((tail & !0xff_ffff) | 0x30_3030)?)
-                        as i64,
-                )
-            }
-            20 if bytes[10] == b'T' && bytes[19] == b'Z' => {
+            13 => decimal_thirteen(bytes.try_into().unwrap()),
+            20 | 25 if bytes[10] == b'T' => {
                 let prefix = u64::from_le_bytes(bytes[..8].try_into().unwrap());
                 let day = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
                 let mut index = date_slot(prefix, day);
@@ -110,11 +102,32 @@ impl FastTime {
                     return None;
                 }
                 let code = extract(clock, TIME_NIBBLES);
-                let (hour, minute, second) = clock_parts(code);
-                if hour >= 24 || minute >= 60 || second >= 60 {
+                // Convert all three BCD pairs to binary in parallel.
+                let pairs = code - 6 * ((code >> 4) & 0x0f0f0f);
+                if (pairs + 0x684444) & 0x808080 != 0 {
                     return None;
                 }
-                Some(epoch_day * DAY_MS + ((hour * 3600 + minute * 60 + second) * 1000) as i64)
+                let seconds =
+                    ((pairs >> 16) * 3600 + ((pairs >> 8) & 255) * 60 + (pairs & 255)) as i64;
+                let offset = match (bytes.len(), bytes[19]) {
+                    (20, b'Z') => 0,
+                    (25, sign @ (b'+' | b'-')) if bytes[22] == b':' => {
+                        let pair = |a: u8, b: u8| {
+                            let a = a.wrapping_sub(b'0');
+                            let b = b.wrapping_sub(b'0');
+                            (a < 10 && b < 10).then_some(i64::from(a) * 10 + i64::from(b))
+                        };
+                        let hours = pair(bytes[20], bytes[21])?;
+                        let minutes = pair(bytes[23], bytes[24])?;
+                        if hours >= 24 || minutes >= 60 {
+                            return None;
+                        }
+                        let offset = hours * 3600 + minutes * 60;
+                        if sign == b'+' { offset } else { -offset }
+                    }
+                    _ => return None,
+                };
+                Some(epoch_day * DAY_MS + (seconds - offset) * 1000)
             }
             _ => calendar.timestamp(bytes),
         }
@@ -132,9 +145,9 @@ fn bcd(mut n: u64, digits: u32) -> u64 {
 
 #[inline(always)]
 fn date_slot(prefix: u64, day: u16) -> usize {
-    ((prefix >> 40).wrapping_mul(241) ^ u64::from(day).wrapping_mul(109) ^ (u64::from(day) >> 8))
-        as usize
-        & 127
+    // Separate adjacent months and advance one slot per day. The exact atom
+    // comparison and linear probe also handle year/month wrapping.
+    (((prefix >> 48) * 31 + u64::from(day) * 10 + u64::from(day >> 8)) & 127) as usize
 }
 
 #[inline(always)]
@@ -179,6 +192,42 @@ fn ascii_digits(word: u64, lanes: u64) -> bool {
 }
 
 #[inline(always)]
+fn decimal_thirteen(bytes: &[u8; 13]) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        // Two overlapping eight-byte loads stay inside the field. Arrange
+        // the digits as sixteen lanes padded on the left with three zeros.
+        let first = _mm_loadl_epi64(bytes.as_ptr().cast());
+        let last = _mm_loadl_epi64(bytes.as_ptr().add(5).cast());
+        let parts = _mm_unpacklo_epi64(first, last);
+        let digits = _mm_shuffle_epi8(
+            _mm_sub_epi8(parts, _mm_set1_epi8(b'0' as i8)),
+            _mm_setr_epi8(-1, -1, -1, 0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15),
+        );
+        let in_range = _mm_cmpeq_epi8(_mm_min_epu8(digits, _mm_set1_epi8(9)), digits);
+        if _mm_movemask_epi8(in_range) != 0xffff {
+            return None;
+        }
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+        let eights = _mm_madd_epi16(_mm_packs_epi32(quads, quads), _mm_set1_epi32(0x0001_2710));
+        let both = _mm_cvtsi128_si64(eights) as u64;
+        Some(i64::from(both as u32) * 100_000_000 + (both >> 32) as i64)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    {
+        let head = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let tail = u64::from_le_bytes(bytes[5..13].try_into().unwrap());
+        Some(
+            (decimal_eight(head)? * 100_000 + decimal_eight((tail & !0xff_ffff) | 0x30_3030)?)
+                as i64,
+        )
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+#[inline(always)]
 fn decimal_eight(word: u64) -> Option<u64> {
     if !ascii_digits(word, u64::MAX) {
         return None;
@@ -193,6 +242,32 @@ fn decimal_eight(word: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::input::timestamp;
+
+    #[test]
+    fn matches_calendar_for_all_single_byte_mutations() {
+        let start = timestamp(b"2028-03-01T00:00:00Z").unwrap();
+        let calendar = Calendar::new(start);
+        let fast =
+            FastTime::new(&calendar, start - 7 * DAY_MS, start, start + 33 * DAY_MS).unwrap();
+        for reference in [
+            b"2028-02-29T23:59:59Z".as_slice(),
+            b"2028-04-01T00:09:13-23:59",
+            b"0001234567890",
+            b"00000000012345678901",
+        ] {
+            for at in 0..reference.len() {
+                let mut bytes = reference.to_vec();
+                for value in 0..=255 {
+                    bytes[at] = value;
+                    assert_eq!(
+                        fast.timestamp(&bytes, &calendar),
+                        calendar.timestamp(&bytes),
+                        "{bytes:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn exact_atoms_and_decimal_lanes_match_the_calendar() {
