@@ -6,7 +6,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::aggregate::{CampaignDaily, Daily, Person, TimedClick, TimedEvent, UserId};
 use crate::catalog::Catalog;
-use crate::input::{Calendar, ChunkRows, DAY_MS, WEEK_MS, data_rows, decimal, fields};
+use crate::input::{Calendar, ChunkRows, DAY_MS, RowWindows, WEEK_MS, data_rows, decimal, fields};
 use crate::stages::Stages;
 
 const INVALID: u32 = u32::MAX;
@@ -280,6 +280,7 @@ fn transpose<T>(source: Vec<Vec<Vec<T>>>, count: usize) -> Vec<Vec<Vec<T>>> {
 fn parse<T: Send, const N: usize>(
     chunks: &[&[u8]],
     count: usize,
+    window_rows: bool,
     parse: impl Fn([&[u8]; N]) -> Option<Option<T>> + Sync,
     key: impl Fn(&T) -> Key + Sync,
 ) -> Option<Vec<Vec<Vec<T>>>> {
@@ -292,9 +293,19 @@ fn parse<T: Send, const N: usize>(
         .map(|chunks| {
             let mut output = buckets(count);
             for chunk in chunks {
-                for row in ChunkRows::new(chunk) {
+                let mut push = |row| {
                     if let Some(item) = parse(row)? {
                         output[bucket(key(&item), count)].push(item);
+                    }
+                    Some(())
+                };
+                if window_rows {
+                    for row in RowWindows::new(chunk) {
+                        push(row)?;
+                    }
+                } else {
+                    for row in ChunkRows::new(chunk) {
+                        push(row)?;
                     }
                 }
             }
@@ -328,9 +339,70 @@ fn dedup(groups: Vec<Vec<Candidate>>, links: &Links, count: usize) -> Vec<Vec<Ev
             }
         }
     }
+    route(table.into_iter(), links, &mut output);
+    output
+}
+
+/// Store only a fingerprint and a row coordinate in the dedup table.
+/// The first pass marks losers in place. The second reads winners sequentially.
+fn dedup_indexed(mut groups: Vec<Vec<Candidate>>, links: &Links, count: usize) -> Vec<Vec<Event>> {
+    const ROW_BITS: u32 = 20;
+    const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
+    if groups.len() >= (1 << (32 - ROW_BITS))
+        || groups.iter().any(|group| group.len() > ROW_MASK as usize)
+    {
+        return dedup(groups, links, count);
+    }
+    let total: usize = groups.iter().map(Vec::len).sum();
+    let mut output = buckets(count);
+    if total == 0 {
+        return output;
+    }
+    let mut slots = vec![0_u64; (total + total / 2 + 1).next_power_of_two()];
+    let mask = slots.len() - 1;
+    for group in 0..groups.len() {
+        for index in 0..groups[group].len() {
+            let row = groups[group][index];
+            let hash = row.event.hash();
+            let location = ((group as u32) << ROW_BITS) | index as u32;
+            // The low word is biased by one, so zero is always an empty slot.
+            let fingerprint = (hash & 0xffff_ffff_0000_0000) | u64::from(location + 1);
+            let mut slot = hash as usize & mask;
+            loop {
+                let next = slots[slot];
+                if next == 0 {
+                    slots[slot] = fingerprint;
+                    break;
+                }
+                if next >> 32 == fingerprint >> 32 {
+                    let old = next as u32 - 1;
+                    let old_group = (old >> ROW_BITS) as usize;
+                    let old_index = (old & ROW_MASK) as usize;
+                    let chosen = &mut groups[old_group][old_index];
+                    if chosen.event == row.event {
+                        if row.ingest < chosen.ingest {
+                            chosen.ts = INVALID;
+                            slots[slot] = fingerprint;
+                        } else {
+                            groups[group][index].ts = INVALID;
+                        }
+                        break;
+                    }
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+    }
+    drop(slots);
+    route(groups.into_iter().flatten(), links, &mut output);
+    output
+}
+
+fn route(rows: impl Iterator<Item = Candidate>, links: &Links, output: &mut [Vec<Event>]) {
     // Frequent aliases can bypass the larger catalog table.
     let mut cache = [(Key(0), Key(0)); 1024];
-    for row in table.into_iter().filter(|row| row.ts != INVALID) {
+    let count = output.len();
+    for row in rows.filter(|row| row.ts != INVALID) {
         let tag = row.user.hash();
         let entry = &mut cache[tag as usize & 1023];
         let user = if entry.0 == row.user {
@@ -346,7 +418,6 @@ fn dedup(groups: Vec<Vec<Candidate>>, links: &Links, count: usize) -> Vec<Vec<Ev
             purchase: row.purchase,
         });
     }
-    output
 }
 
 fn flatten<T>(groups: Vec<Vec<T>>) -> Vec<T> {
@@ -355,6 +426,181 @@ fn flatten<T>(groups: Vec<Vec<T>>) -> Vec<T> {
         output.append(&mut group)
     }
     output
+}
+
+struct TimelineClick {
+    ts: u32,
+    campaign: u32,
+    id: Key,
+}
+
+impl TimedClick for TimelineClick {
+    fn timestamp(&self) -> i64 {
+        i64::from(self.ts)
+    }
+    fn campaign(&self) -> usize {
+        self.campaign as usize
+    }
+}
+
+struct TimelineEvent(u64);
+
+impl TimedEvent for TimelineEvent {
+    fn timestamp(&self) -> i64 {
+        (self.0 >> 32) as i64
+    }
+    fn purchase(&self) -> (u32, u32) {
+        let packed = self.0 as u32;
+        (packed & PRICE_MASK, packed >> 24)
+    }
+}
+
+type BucketPair = (Vec<Vec<Event>>, Vec<Vec<Click>>);
+
+struct Job {
+    buckets: Vec<BucketPair>,
+    weight: usize,
+}
+
+fn coalesce(events: Vec<Vec<Vec<Event>>>, clicks: Vec<Vec<Vec<Click>>>) -> Vec<Job> {
+    let mut buckets: Vec<_> = events
+        .into_iter()
+        .zip(clicks)
+        .filter_map(|(events, clicks)| {
+            let event_rows: usize = events.iter().map(Vec::len).sum();
+            let click_rows: usize = clicks.iter().map(Vec::len).sum();
+            (event_rows != 0).then_some((event_rows + click_rows, (events, clicks)))
+        })
+        .collect();
+    buckets.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut jobs: Vec<_> = (0..rayon::current_num_threads().min(buckets.len()))
+        .map(|_| Job {
+            buckets: Vec::new(),
+            weight: 0,
+        })
+        .collect();
+    for (weight, bucket) in buckets {
+        let job = jobs.iter_mut().min_by_key(|job| job.weight).unwrap();
+        job.weight += weight;
+        job.buckets.push(bucket);
+    }
+    jobs
+}
+
+/// Grouping writes a compact append-only arena. A person stores just two heads,
+/// so it never allocates its own vector or requires a partition-wide sort.
+#[derive(Default)]
+struct TimelineGroups {
+    people: FxHashMap<Key, usize>,
+    heads: Vec<(Key, u32, u32)>,
+    times: Vec<(u64, u32)>,
+    touches: Vec<(TimelineClick, u32)>,
+    person_events: Vec<TimelineEvent>,
+    person_clicks: Vec<TimelineClick>,
+    scratch: Person,
+}
+
+impl TimelineGroups {
+    fn run(
+        &mut self,
+        (events, clicks): BucketPair,
+        organic: usize,
+        base: i64,
+        out: &mut Daily<'static>,
+    ) {
+        let n: usize = events.iter().map(Vec::len).sum();
+        let c: usize = clicks.iter().map(Vec::len).sum();
+        if n >= INVALID as usize || c >= INVALID as usize {
+            aggregate_sorted((events, clicks), organic, base, out);
+            return;
+        }
+        self.people.clear();
+        self.heads.clear();
+        self.times.clear();
+        self.touches.clear();
+        self.times.reserve(n);
+        self.touches.reserve(c);
+        self.people.reserve(n / 24);
+        for event in events.into_iter().flatten() {
+            let person = *self.people.entry(event.user).or_insert_with(|| {
+                let at = self.heads.len();
+                self.heads.push((event.user, INVALID, INVALID));
+                at
+            });
+            let head = &mut self.heads[person].1;
+            let position = self.times.len() as u32;
+            self.times.push((
+                (u64::from(event.ts) << 32) | u64::from(event.purchase),
+                *head,
+            ));
+            *head = position;
+        }
+        for click in clicks.into_iter().flatten() {
+            if let Some(&person) = self.people.get(&click.user) {
+                let head = &mut self.heads[person].2;
+                let position = self.touches.len() as u32;
+                self.touches.push((
+                    TimelineClick {
+                        ts: click.ts,
+                        campaign: click.campaign,
+                        id: click.id,
+                    },
+                    *head,
+                ));
+                *head = position;
+            }
+        }
+        for &(user, mut events, mut clicks) in &self.heads {
+            self.person_events.clear();
+            self.person_clicks.clear();
+            while events != INVALID {
+                let (word, next) = self.times[events as usize];
+                self.person_events.push(TimelineEvent(word));
+                events = next;
+            }
+            while clicks != INVALID {
+                let (ref click, next) = self.touches[clicks as usize];
+                self.person_clicks.push(TimelineClick {
+                    ts: click.ts,
+                    campaign: click.campaign,
+                    id: click.id,
+                });
+                clicks = next;
+            }
+            self.person_events.sort_unstable_by_key(|event| event.0);
+            self.person_clicks
+                .sort_unstable_by_key(|click| (click.ts, click.id));
+            self.scratch.aggregate(
+                UserId::Packed(user),
+                &self.person_events,
+                &self.person_clicks,
+                organic,
+                base,
+                out,
+            );
+        }
+    }
+}
+
+fn aggregate_sorted(
+    (events, clicks): BucketPair,
+    organic: usize,
+    base: i64,
+    daily: &mut Daily<'static>,
+) {
+    let mut events = flatten(events);
+    let mut clicks = flatten(clicks);
+    events.sort_unstable_by_key(|row| (row.user, row.ts));
+    clicks.sort_unstable_by_key(|row| (row.user, row.ts, row.id));
+    let mut clicks = clicks.as_slice();
+    let mut scratch = Person::default();
+    for events in events.chunk_by(|a, b| a.user == b.user) {
+        let user = events[0].user;
+        clicks = &clicks[clicks.partition_point(|row| row.user < user)..];
+        let (matches, remainder) = clicks.split_at(clicks.partition_point(|row| row.user == user));
+        clicks = remainder;
+        scratch.aggregate(UserId::Packed(user), events, matches, organic, base, daily);
+    }
 }
 
 pub struct Parsed {
@@ -374,6 +620,7 @@ pub fn parse_inputs<'a>(
     window: Range<i64>,
     count: usize,
     dedup_count: usize,
+    indexed: bool,
 ) -> Option<Parsed> {
     let base = (window.start - WEEK_MS).div_euclid(DAY_MS) * DAY_MS;
     if !count.is_power_of_two()
@@ -393,18 +640,38 @@ pub fn parse_inputs<'a>(
         cutoff_days,
         end: window.end,
     };
+    let window_rows =
+        indexed && std::env::var_os("SHOPPING_SCANNER").is_none_or(|mode| mode != "block");
     let ((events, clicks), links) = rayon::join(
         || {
             rayon::join(
-                || parse(events, dedup_count, |r| parser.event(r), |item| item.event),
+                || {
+                    parse(
+                        events,
+                        dedup_count,
+                        window_rows,
+                        |r| parser.event(r),
+                        |item| item.event,
+                    )
+                },
                 || {
                     clicks
                         .par_iter()
                         .map(|chunk| {
                             let mut output = Vec::new();
-                            for row in ChunkRows::new(chunk) {
+                            let mut push = |row| {
                                 if let Some(click) = parser.click(row)? {
                                     output.push(click);
+                                }
+                                Some(())
+                            };
+                            if window_rows {
+                                for row in RowWindows::new(chunk) {
+                                    push(row)?;
+                                }
+                            } else {
+                                for row in ChunkRows::new(chunk) {
+                                    push(row)?;
                                 }
                             }
                             Some(output)
@@ -430,6 +697,7 @@ impl Parsed {
         self,
         count: usize,
         organic: usize,
+        indexed: bool,
         stages: &mut Stages,
     ) -> Vec<Daily<'static>> {
         let Self {
@@ -440,11 +708,12 @@ impl Parsed {
             first_day,
             days,
         } = self;
+        let choose = if indexed { dedup_indexed } else { dedup };
         let (events, clicks) = rayon::join(
             || {
                 events
                     .into_par_iter()
-                    .map(|group| dedup(group, &links, count))
+                    .map(|group| choose(group, &links, count))
                     .collect()
             },
             || {
@@ -464,38 +733,40 @@ impl Parsed {
         let events = transpose(events, count);
         let clicks = transpose(clicks, count);
         stages.mark("packed_dedup_and_partition");
-        events
-            .into_par_iter()
-            .zip(clicks)
-            .map(|(events, clicks)| {
-                let mut events = flatten(events);
-                let mut clicks = flatten(clicks);
-                events.sort_unstable_by_key(|row| (row.user, row.ts));
-                clicks.sort_unstable_by_key(|row| (row.user, row.ts, row.id));
-                let mut clicks = clicks.as_slice();
-                let mut scratch = Person::default();
-                let mut daily = Daily {
-                    users: Vec::new(),
-                    campaigns: CampaignDaily::dense(first_day, days, organic + 1),
-                };
-                for events in events.chunk_by(|a, b| a.user == b.user) {
-                    let user = events[0].user;
-                    clicks = &clicks[clicks.partition_point(|row| row.user < user)..];
-                    let (relevant, remainder) =
-                        clicks.split_at(clicks.partition_point(|row| row.user == user));
-                    clicks = remainder;
-                    scratch.aggregate(
-                        UserId::Packed(user),
-                        events,
-                        relevant,
-                        organic,
-                        base,
-                        &mut daily,
-                    );
-                }
-                daily
-            })
-            .collect()
+        if indexed {
+            let linked = std::env::var_os("SHOPPING_TIMELINES").is_none_or(|value| value != "sort");
+            coalesce(events, clicks)
+                .into_par_iter()
+                .map(|job| {
+                    let mut daily = Daily {
+                        users: Vec::new(),
+                        campaigns: CampaignDaily::dense(first_day, days, organic + 1),
+                    };
+                    let mut grouping = TimelineGroups::default();
+                    for pair in job.buckets {
+                        if linked {
+                            grouping.run(pair, organic, base, &mut daily);
+                        } else {
+                            aggregate_sorted(pair, organic, base, &mut daily);
+                        }
+                    }
+                    daily
+                })
+                .collect()
+        } else {
+            events
+                .into_par_iter()
+                .zip(clicks)
+                .map(|pair| {
+                    let mut daily = Daily {
+                        users: Vec::new(),
+                        campaigns: CampaignDaily::dense(first_day, days, organic + 1),
+                    };
+                    aggregate_sorted(pair, organic, base, &mut daily);
+                    daily
+                })
+                .collect()
+        }
     }
 }
 

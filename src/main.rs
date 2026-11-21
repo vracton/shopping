@@ -28,6 +28,7 @@ enum Architecture {
     Sort,
     Hash,
     Packed,
+    Indexed,
 }
 
 struct Config {
@@ -51,9 +52,10 @@ impl Config {
             "sort" => Architecture::Sort,
             "hash" => Architecture::Hash,
             "packed" => Architecture::Packed,
+            "indexed" => Architecture::Indexed,
             value => {
                 return Err(format!(
-                    "invalid SHOPPING_ARCH {value:?}, expected packed, sort or hash"
+                    "invalid SHOPPING_ARCH {value:?}, expected indexed, packed, sort or hash"
                 )
                 .into());
             }
@@ -61,7 +63,9 @@ impl Config {
         let (chunk_kib, partitions, parquet_rows) = match architecture {
             Architecture::Sort => (4096, 32, 65_536),
             Architecture::Hash | Architecture::Packed => (2048, 64, 16_384),
+            Architecture::Indexed => (1024, 128, 16_384),
         };
+        let indexed = matches!(architecture, Architecture::Indexed);
         Ok(Self {
             data: env::var_os("DATA_DIR").map_or_else(|| PathBuf::from("/data"), PathBuf::from),
             output: env::var_os("OUTPUT_DIR")
@@ -72,7 +76,10 @@ impl Config {
                 .checked_mul(1024)
                 .ok_or("SHOPPING_CHUNK_KIB is too large")?,
             partitions: positive_setting("SHOPPING_PARTITIONS", partitions)?,
-            dedup_partitions: positive_setting("SHOPPING_DEDUP_PARTITIONS", 64)?,
+            dedup_partitions: positive_setting(
+                "SHOPPING_DEDUP_PARTITIONS",
+                if indexed { 512 } else { 64 },
+            )?,
             parquet_rows: positive_setting("SHOPPING_PARQUET_ROWS", parquet_rows)?,
         })
     }
@@ -127,7 +134,10 @@ fn run(config: &Config) -> Result<()> {
     let event_chunks = chunks(&event_maps, config.chunk_bytes);
     let click_chunks = chunks(&click_maps, config.chunk_bytes);
     stages.mark("setup");
-    if matches!(config.architecture, Architecture::Packed) {
+    if matches!(
+        config.architecture,
+        Architecture::Packed | Architecture::Indexed
+    ) {
         let catalog = Catalog::new(
             std::iter::empty(),
             products.as_deref().unwrap_or_default(),
@@ -141,12 +151,20 @@ fn run(config: &Config) -> Result<()> {
             window.clone(),
             config.partitions,
             config.dedup_partitions,
+            matches!(config.architecture, Architecture::Indexed),
         ) {
             stages.mark("packed_parse_and_links");
             drop((event_chunks, click_chunks));
             let ((), daily) = rayon::join(
                 || drop((event_maps, click_maps, links)),
-                || parsed.aggregate(config.partitions, catalog.organic, &mut stages),
+                || {
+                    parsed.aggregate(
+                        config.partitions,
+                        catalog.organic,
+                        matches!(config.architecture, Architecture::Indexed),
+                        &mut stages,
+                    )
+                },
             );
             stages.mark("packed_order_and_aggregate");
             output::write(
@@ -180,7 +198,7 @@ fn run(config: &Config) -> Result<()> {
                 .map(|(events, clicks)| aggregate(events, clicks, catalog.organic))
                 .collect()
         }
-        Architecture::Hash | Architecture::Packed => input
+        Architecture::Hash | Architecture::Packed | Architecture::Indexed => input
             .hash(config.partitions, &mut stages)
             .into_par_iter()
             .map(|batch| aggregate(&batch.events, &batch.clicks, catalog.organic))

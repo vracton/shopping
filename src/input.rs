@@ -489,6 +489,137 @@ impl Calendar {
     }
 }
 
+/// A row-oriented scanner that extracts every field boundary from two masks.
+/// Fixed-width loads are only used when the complete load is inside the shard.
+pub struct RowWindows<'a, const N: usize> {
+    remaining: &'a [u8],
+}
+
+impl<'a, const N: usize> RowWindows<'a, N> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+}
+
+impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
+    type Item = [&'a [u8]; N];
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        while !self.remaining.is_empty() {
+            let bytes = self.remaining;
+            if bytes.len() >= 128 {
+                let (newline, commas, quotes) = row_masks(bytes);
+                if newline != 0 {
+                    let end = newline.trailing_zeros() as usize;
+                    self.remaining = &bytes[end + 1..];
+                    let inside = (1_u128 << end) - 1;
+                    let mut commas = commas & inside;
+                    let quotes = quotes & inside;
+                    if end == 0 || commas.count_ones() as usize != N - 1 {
+                        continue;
+                    }
+                    let boundaries = commas | (1 << end);
+                    let starts = (commas << 1) | 1;
+                    let ends = boundaries >> 1;
+                    if quotes & !(starts | ends) != 0 {
+                        continue;
+                    }
+                    let mut start = 0;
+                    let mut output = [&[][..]; N];
+                    let mut valid = true;
+                    for (index, field) in output.iter_mut().enumerate() {
+                        let end = if index + 1 == N {
+                            end
+                        } else {
+                            let place = commas.trailing_zeros() as usize;
+                            commas &= commas - 1;
+                            place
+                        };
+                        let raw = &bytes[start..end];
+                        if !raw.is_empty() && raw[0] == b'"' {
+                            if raw.len() < 2 || raw[raw.len() - 1] != b'"' {
+                                valid = false;
+                                break;
+                            }
+                            // An adjacent delimiter can make an interior position
+                            // eligible in other fields, so keep validation local here.
+                            *field = &raw[1..raw.len() - 1];
+                        } else if raw.last() == Some(&b'"') {
+                            valid = false;
+                            break;
+                        } else {
+                            *field = raw;
+                        }
+                        start = end + 1;
+                    }
+                    if valid {
+                        return Some(output);
+                    }
+                    continue;
+                }
+            }
+            let row = if let Some(end) = memchr(b'\n', bytes) {
+                self.remaining = &bytes[end + 1..];
+                &bytes[..end]
+            } else {
+                std::mem::take(&mut self.remaining)
+            };
+            if let Some(fields) = fields(row) {
+                return Some(fields);
+            }
+        }
+        None
+    }
+}
+
+#[inline]
+fn row_masks(bytes: &[u8]) -> (u128, u128, u128) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        let mut result = (0_u128, 0_u128, 0_u128);
+        for offset in [0, 32, 64, 96] {
+            // The caller provides at least 128 readable bytes.
+            let (newline, comma, quote) = unsafe {
+                let data = _mm256_loadu_si256(bytes.as_ptr().add(offset).cast());
+                (
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8(b'\n' as i8)))
+                        as u32,
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8(b',' as i8)))
+                        as u32,
+                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8(b'"' as i8)))
+                        as u32,
+                )
+            };
+            result.0 |= u128::from(newline) << offset;
+            result.1 |= u128::from(comma) << offset;
+            result.2 |= u128::from(quote) << offset;
+            if newline != 0 {
+                break;
+            }
+        }
+        result
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let mut result = (0_u128, 0_u128, 0_u128);
+        for (index, &byte) in bytes[..128].iter().enumerate() {
+            let bit = 1_u128 << index;
+            match byte {
+                b'\n' => {
+                    result.0 |= bit;
+                    break;
+                }
+                b',' => result.1 |= bit,
+                b'"' => result.2 |= bit,
+                _ => {}
+            }
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +675,30 @@ mod tests {
             assert_eq!(
                 ChunkRows::<4>::new(&data).collect::<Vec<_>>(),
                 rows(&data).filter_map(fields::<4>).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn window_scanner_matches_scalar() {
+        let mut state = 5_u64;
+        let alphabet = b"abcd12,\n\r\",,";
+        for size in 0..900 {
+            let mut bytes = Vec::new();
+            for _ in 0..size {
+                state = state
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(3037000493);
+                bytes.push(alphabet[(state >> 32) as usize % alphabet.len()]);
+            }
+            bytes.extend_from_slice(b"\" abc\",b,c,\"d\"\n\"\"x,y,z,q\na,,c,d\n");
+            assert_eq!(
+                RowWindows::<2>::new(&bytes).collect::<Vec<_>>(),
+                rows(&bytes).filter_map(fields::<2>).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                RowWindows::<4>::new(&bytes).collect::<Vec<_>>(),
+                rows(&bytes).filter_map(fields::<4>).collect::<Vec<_>>()
             );
         }
     }
