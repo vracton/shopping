@@ -539,11 +539,9 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
                     if quotes & !(starts ^ ends) != 0 {
                         continue;
                     }
-                    // Adding each opening flag to the complemented boundary mask
-                    // carries through that field to its closing delimiter.
-                    let closing_boundaries =
-                        (!boundaries).wrapping_add(quotes & starts) & boundaries;
-                    if closing_boundaries != (quotes << 1) & boundaries {
+                    // Compare opening and closing flags in field order.
+                    let opened = extract_bits(quotes, starts);
+                    if opened != extract_bits(quotes << 1, boundaries) {
                         continue;
                     }
                     let mut start = 0;
@@ -555,7 +553,7 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
                             commas &= commas - 1;
                             stop
                         };
-                        let trim = usize::from(unsafe { *bytes.get_unchecked(start) } == b'"');
+                        let trim = ((opened >> i) & 1) as usize;
                         // The mask gave N increasing boundaries before the
                         // newline. A quoted field has two distinct quote bytes.
                         let field = unsafe { bytes.get_unchecked(start + trim..stop - trim) };
@@ -575,6 +573,29 @@ impl<'a, const N: usize> Iterator for RowWindows<'a, N> {
             }
         }
         None
+    }
+}
+
+#[inline(always)]
+fn extract_bits(word: u128, mask: u128) -> u128 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        use std::arch::x86_64::_pext_u64;
+        let low = mask as u64;
+        u128::from(_pext_u64(word as u64, low))
+            | (u128::from(_pext_u64((word >> 64) as u64, (mask >> 64) as u64)) << low.count_ones())
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut mask = mask;
+        let mut result = 0;
+        let mut target = 1;
+        while mask != 0 {
+            result |= u128::from(word & (mask & mask.wrapping_neg()) != 0) * target;
+            mask &= mask - 1;
+            target <<= 1;
+        }
+        result
     }
 }
 
