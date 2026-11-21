@@ -1,14 +1,27 @@
 //! Assign canonical identities during routing. A view or cart then crosses the
 //! thread boundary in eight bytes, and the grouping worker can count by slot.
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU32, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 
-const REDIRECT: u64 = 1 << 63;
 const PROBES: usize = 96;
 
+#[derive(Default)]
+struct Slot {
+    key: AtomicU64,
+    destination: AtomicU32,
+}
+
+#[derive(Default)]
+#[repr(align(64))]
+struct Used(AtomicU32);
+
 pub(super) struct Directory {
-    keys: Vec<AtomicU64>,
-    roots: Vec<u32>,
+    slots: Vec<Slot>,
+    names: Vec<AtomicU64>,
+    used: Vec<Used>,
     shift: u32,
     parts: usize,
 }
@@ -16,7 +29,7 @@ pub(super) struct Directory {
 impl Directory {
     pub(super) fn new(chunks: &[&[u8]], bytes: usize, parts: usize) -> Option<Self> {
         // Size is only a space/time heuristic. Every identity that cannot get
-        // a slot takes the full-key path. Cap this auxiliary table at 96 MiB.
+        // a slot takes the full-key path. Cap the key and name arrays at 192 MiB.
         let size = (bytes / 768)
             .max(parts)
             .max(64)
@@ -26,8 +39,9 @@ impl Directory {
             return None;
         }
         let mut table = Self {
-            keys: (0..size).map(|_| AtomicU64::new(0)).collect(),
-            roots: vec![0; size],
+            slots: (0..size).map(|_| Slot::default()).collect(),
+            names: (0..size).map(|_| AtomicU64::new(0)).collect(),
+            used: (0..parts).map(|_| Used::default()).collect(),
             shift: (size / parts).trailing_zeros(),
             parts,
         };
@@ -55,15 +69,30 @@ impl Directory {
             }
         }
         table.join_edges(&mut pending, &mut joined)?;
-        for child in joined.into_iter().rev() {
-            let parent = table.roots[child] as usize - 1;
-            let root = if *table.keys[parent].get_mut() & REDIRECT != 0 {
-                table.roots[parent]
-            } else {
-                parent as u32
-            };
-            *table.keys[child].get_mut() |= REDIRECT;
-            table.roots[child] = root;
+        // Flatten before changing the meaning of a slot's destination.
+        for &child in joined.iter().rev() {
+            let parent = *table.slots[child].destination.get_mut();
+            let root = *table.slots[parent as usize - 1].destination.get_mut();
+            if root != 0 {
+                *table.slots[child].destination.get_mut() = root;
+            }
+        }
+        // Within each partition, assign consecutive destinations to roots only.
+        // An unlinked key discovered later takes the next free destination.
+        for (i, entry) in table.slots.iter_mut().enumerate() {
+            let key = *entry.key.get_mut();
+            if key != 0 && *entry.destination.get_mut() == 0 {
+                let part = i >> table.shift;
+                let count = table.used[part].0.get_mut();
+                let slot = (part << table.shift) + *count as usize;
+                *count += 1;
+                *table.names[slot].get_mut() = key;
+                *entry.destination.get_mut() = slot as u32 + 1;
+            }
+        }
+        for child in joined {
+            let root = *table.slots[child].destination.get_mut() as usize - 1;
+            *table.slots[child].destination.get_mut() = *table.slots[root].destination.get_mut();
         }
         Some(table)
     }
@@ -75,12 +104,13 @@ impl Directory {
             let a = self.root(a);
             let b = self.root(b);
             if a != b {
-                let (child, parent) = if *self.keys[a].get_mut() > *self.keys[b].get_mut() {
+                let (child, parent) = if *self.slots[a].key.get_mut() > *self.slots[b].key.get_mut()
+                {
                     (a, b)
                 } else {
                     (b, a)
                 };
-                self.roots[child] = parent as u32 + 1;
+                *self.slots[child].destination.get_mut() = parent as u32 + 1;
                 joined.push(child);
             }
         }
@@ -88,10 +118,10 @@ impl Directory {
     }
 
     fn insert(&mut self, key: Key) -> Option<usize> {
-        let mask = self.keys.len() - 1;
+        let mask = self.slots.len() - 1;
         let mut i = key.hash() as usize & mask;
         for _ in 0..PROBES {
-            let tag = self.keys[i].get_mut();
+            let tag = self.slots[i].key.get_mut();
             if *tag == key.0 {
                 return Some(i);
             }
@@ -105,13 +135,13 @@ impl Directory {
     }
 
     fn root(&mut self, mut i: usize) -> usize {
-        while self.roots[i] != 0 {
-            let parent = self.roots[i] as usize - 1;
-            let grandparent = self.roots[parent];
+        while *self.slots[i].destination.get_mut() != 0 {
+            let parent = *self.slots[i].destination.get_mut() as usize - 1;
+            let grandparent = *self.slots[parent].destination.get_mut();
             if grandparent == 0 {
                 return parent;
             }
-            self.roots[i] = grandparent;
+            *self.slots[i].destination.get_mut() = grandparent;
             i = grandparent as usize - 1;
         }
         i
@@ -119,27 +149,38 @@ impl Directory {
 
     pub(super) fn resolve(&self, key: Key) -> Key {
         self.intern(key)
-            .map_or(key, |slot| Key(self.keys[slot].load(Relaxed)))
+            .map_or(key, |slot| Key(self.names[slot].load(Relaxed)))
     }
 
     #[inline(always)]
     fn intern(&self, key: Key) -> Option<usize> {
-        let mask = self.keys.len() - 1;
+        let mask = self.slots.len() - 1;
         let mut index = key.hash() as usize & mask;
         for _ in 0..PROBES {
-            let cell = &self.keys[index];
-            let mut tag = cell.load(Relaxed);
+            let cell = &self.slots[index];
+            let mut tag = cell.key.load(Relaxed);
             if tag == 0 {
-                match cell.compare_exchange(0, key.0, Relaxed, Relaxed) {
-                    Ok(_) => return Some(index),
+                match cell.key.compare_exchange(0, key.0, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        let part = index >> self.shift;
+                        let local = self.used[part].0.fetch_add(1, Relaxed) as usize;
+                        let slot = (part << self.shift) + local;
+                        self.names[slot].store(key.0, Relaxed);
+                        // Publish both the ordinal and its initialized canonical name.
+                        cell.destination.store(slot as u32 + 1, Release);
+                        return Some(slot);
+                    }
                     Err(stored) => tag = stored,
                 }
             }
             if tag == key.0 {
-                return Some(index);
-            }
-            if tag == key.0 | REDIRECT {
-                return Some(self.roots[index] as usize);
+                loop {
+                    let dest = cell.destination.load(Acquire);
+                    if dest != 0 {
+                        return Some(dest as usize - 1);
+                    }
+                    std::hint::spin_loop();
+                }
             }
             index = (index + 1) & mask;
         }
@@ -150,10 +191,10 @@ impl Directory {
     fn prefetch(&self, key: Key) {
         #[cfg(target_arch = "x86_64")]
         {
-            let index = key.hash() as usize & (self.keys.len() - 1);
+            let index = key.hash() as usize & (self.slots.len() - 1);
             unsafe {
                 std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                    self.keys.as_ptr().add(index).cast(),
+                    self.slots.as_ptr().add(index).cast(),
                 )
             }
         }
@@ -305,7 +346,9 @@ impl Directory {
                 let mut times = Vec::new();
                 for part in job.buckets {
                     let span = 1 << self.shift;
-                    let keys = &self.keys[part.index * span..(part.index + 1) * span];
+                    let start = part.index * span;
+                    let used = self.used[part.index].0.load(Relaxed) as usize;
+                    let keys = &self.names[start..start + used];
                     if columns {
                         part.finish::<3>(
                             keys,
@@ -496,11 +539,11 @@ mod tests {
         for name in [b"a", b"b", b"c", b"d"] {
             assert_eq!(table.intern(key(name)), Some(canonical));
         }
-        assert_eq!(table.keys[canonical].load(Relaxed), key(b"a").0);
+        assert_eq!(table.names[canonical].load(Relaxed), key(b"a").0);
 
         let names: Vec<_> = (1..100000)
             .map(Key)
-            .filter(|k| k.hash() as usize % table.keys.len() == 0)
+            .filter(|k| k.hash() as usize % table.slots.len() == 0)
             .take(130)
             .collect();
         let parallel: Vec<_> = names.par_iter().map(|&k| table.intern(k)).collect();
@@ -508,7 +551,7 @@ mod tests {
         for (name, slot) in names.into_iter().zip(parallel) {
             assert_eq!(table.intern(name), slot);
             if let Some(slot) = slot {
-                assert_eq!(table.keys[slot].load(Relaxed), name.0);
+                assert_eq!(table.names[slot].load(Relaxed), name.0);
             } else {
                 spills += 1;
             }
