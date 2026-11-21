@@ -137,11 +137,30 @@ Local 20M-event results on the 1.90 GB practice proxy with eight logical CPUs an
 
 Each file-backed series followed a warmup. The first warmup on the spread CPU mask took 10.590 s. Cache state was uncontrolled, and neither these times nor the tmpfs diagnostic represent an official scorer result. The tmpfs sweep compared 64 and 256 dedup buckets and 2 and 8 MiB chunks. The selected 64-bucket, 2 MiB combination had the most consistent times. File-backed mmap had better local results than buffering entire shards, so `SHOPPING_IO=buffered` remains opt-in. Both modes keep all intermediate records in memory. Final-scale 60M performance remains unmeasured.
 
-The local Docker image matched the 20M sort reference exactly, including all 2,240,415 user-day rows and 28,014 campaign-day rows. Docker runs pinned to eight CPUs with a 24 GB container limit on the 8 GiB WSL2 guest took 3.842–15.133 s on file-backed input. The later tmpfs Docker diagnostics were also slower than the host-process benchmark. The 3.5 s target is verified for the repeated host-process benchmark. Official scorer timing is pending. All three architectures passed the 36 fixtures under three configurations, the three 1M seeds matched across architectures, and seed 1 matched the public answer.
+The local Docker image matched the 20M sort reference exactly, including all 2,240,415 user-day rows and 28,014 campaign-day rows. Docker runs pinned to eight CPUs with a 24 GB container limit on the 8 GiB WSL2 guest took 3.842–15.133 s on file-backed input. The later tmpfs Docker diagnostics were also slower than the host-process benchmark. The 3.5 s target is verified for the repeated host-process benchmark. The user reported 1.78 s on the official scorer. All three original architectures passed the 36 fixtures under three configurations, the three 1M seeds matched across architectures, and seed 1 matched the public answer.
 
 On the representative 2.415 s run, parsing and links took 0.923 s, dedup and redistribution 0.695 s, ordering and aggregation 0.357 s, and Parquet 0.148 s. To reproduce on a scorer-compatible x86-64 host:
 
 ```sh
 cargo rustc --release --locked -- -C target-cpu=x86-64-v3
 BENCH_STAGES=1 python3 scripts/bench.py run /tmp/shopping-practice --cpus 8 --warmups 1 --repeats 3 -- ./target/release/shopping-sessions
+```
+
+### Experiments after the 1.78 s submission
+
+The reported comparison was 1.78 s for our submission and 1.05 s for Xero. Xero's public code suggested smaller dedup tables and sorting timestamps within each person's group. The external checkout and benchmark outputs are kept outside the repository.
+
+| Stage | Experiment | Observed outcome |
+| --- | --- | --- |
+| Input and parsing | Row-oriented SIMD scanner, exact date atoms, BCD ingest comparisons, and SWAR decimal timestamps | All fixtures and the public answer matched. One filtered run spent 0.505 s in the event decode and scatter span. Overlapping alias work took 0.648 s and total parsing took 0.656 s. |
+| Dedup and alias routing | Small index table with loser marking, a collision bitmap that escalates ambiguous IDs to an exact table, and an optional parallel union-find | In a comparable faster run, filtered dedup and routing took 0.383 s versus 0.575 s for the packed baseline. The filtered run lost the gain in later stages and overall. |
+| Ordering, sessions, and attribution | Append-only linked timelines, counted contiguous timelines, and temporal bins with width 30 minutes + 1 ms | Linked timelines were slower in the initial comparison. Temporal bins avoid sorting event timestamps for large shoppers and produced exact user and campaign tables, including the 20M reference. The randomized test compares them against sorted sessions. |
+| Payload routing | Place valid payloads in shopper partitions at decode time. A separate event-ID index uses atomic tombstones for exact duplicates, including invalid earliest copies. | Passed the 36 fixtures, public answer, and full 20M reference. Its profiled run took 13.22 s under variable WSL2 conditions, with no demonstrated end-to-end win. |
+| Output and exit | Profile user and campaign output separately, try uncompressed Parquet and kernel cleanup after writers close | Both options preserved exact output. Local measurements did not establish a repeatable total-time win. The allocator experiment also showed no repeatable win and was removed. |
+
+The fastest observed local 20M time in this sweep was 1.688 s with the previous packed binary. The filtered candidate reached 1.727 s, and other runs varied substantially on the same input and CPU mask. The sub-second target was not reached. Keep `packed` as the default and select `indexed` explicitly to benchmark the experiments. `BENCH_STAGES=1` shows non-overlapping wall stages and separate `overlap` spans for concurrent work.
+
+```sh
+SHOPPING_ARCH=indexed SHOPPING_ROUTE=split SHOPPING_LINKS=parallel BENCH_STAGES=1 \
+    python3 scripts/bench.py run /tmp/shopping-practice --cpus 8 --warmups 1 --repeats 3 -- ./target/release/shopping-sessions
 ```
