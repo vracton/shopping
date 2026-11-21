@@ -6,7 +6,66 @@ use crate::ingest::{Batches, Click, Event};
 use crate::input::{DAY_MS, WEEK_MS};
 
 const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
-pub type CampaignDaily = FxHashMap<(usize, i32), CampaignStats>;
+#[derive(Debug, PartialEq, Eq)]
+pub enum CampaignDaily {
+    Sparse(FxHashMap<(usize, i32), CampaignStats>),
+    Dense {
+        first: i32,
+        days: usize,
+        values: Vec<CampaignStats>,
+    },
+}
+
+impl Default for CampaignDaily {
+    fn default() -> Self {
+        Self::Sparse(FxHashMap::default())
+    }
+}
+
+impl CampaignDaily {
+    pub fn dense(first: i32, days: usize, campaigns: usize) -> Self {
+        // Fall back for an unusually large dimension. Generated catalogs fit in under 1 MiB per partition.
+        if let Some(slots) = days.checked_mul(campaigns).filter(|&size| size <= 40_000) {
+            Self::Dense {
+                first,
+                days,
+                values: vec![CampaignStats::default(); slots],
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    fn at(&mut self, campaign: usize, day: i32) -> &mut CampaignStats {
+        match self {
+            Self::Sparse(map) => map.entry((campaign, day)).or_default(),
+            Self::Dense {
+                first,
+                days,
+                values,
+            } => &mut values[campaign * *days + (day - *first) as usize],
+        }
+    }
+
+    pub fn for_each(&self, mut visit: impl FnMut((usize, i32), CampaignStats)) {
+        match self {
+            Self::Sparse(map) => map
+                .iter()
+                .for_each(|(&key, value)| visit(key, value.clone())),
+            Self::Dense {
+                first,
+                days,
+                values,
+            } => {
+                for (index, value) in values.iter().enumerate() {
+                    if value.sessions != 0 || value.assisted_sessions != 0 {
+                        visit((index / days, first + (index % days) as i32), value.clone());
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CampaignStats {
@@ -25,8 +84,42 @@ impl AddAssign for CampaignStats {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum UserId<'a> {
+    Bytes(&'a [u8]),
+    Packed(crate::packed::Key),
+}
+
+pub trait TimedEvent {
+    fn timestamp(&self) -> i64;
+    fn purchase(&self) -> (u32, u32);
+}
+
+pub trait TimedClick {
+    fn timestamp(&self) -> i64;
+    fn campaign(&self) -> usize;
+}
+
+impl TimedEvent for Event<'_> {
+    fn timestamp(&self) -> i64 {
+        self.ts
+    }
+    fn purchase(&self) -> (u32, u32) {
+        (self.price, self.category)
+    }
+}
+
+impl TimedClick for Click<'_> {
+    fn timestamp(&self) -> i64 {
+        self.ts
+    }
+    fn campaign(&self) -> usize {
+        self.campaign
+    }
+}
+
 pub struct UserDay<'a> {
-    pub user: &'a [u8],
+    pub user: UserId<'a>,
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
@@ -50,62 +143,87 @@ fn day(ts: i64) -> i32 {
     ts.div_euclid(DAY_MS) as i32
 }
 
-fn add_session(
-    user: &mut UserDay<'_>,
-    events: &[Event<'_>],
-    category_totals: &mut FxHashMap<u32, i64>,
-) -> Session {
-    let mut revenue = 0;
-    for event in events.iter().filter(|event| event.price != 0) {
-        let price = i64::from(event.price);
-        *category_totals.entry(event.category).or_default() += price;
-        revenue += price;
-    }
-    user.sessions += 1;
-    user.events += events.len() as i64;
-    user.revenue += revenue;
-    Session {
-        start: events[0].ts,
-        day: user.day,
-        revenue,
+#[derive(Default)]
+pub struct Person {
+    sessions: Vec<Session>,
+    categories: FxHashMap<u32, i64>,
+    intervals: FxHashMap<usize, (i64, i64)>,
+}
+
+impl Person {
+    pub fn aggregate<'a>(
+        &mut self,
+        user: UserId<'a>,
+        events: &[impl TimedEvent],
+        clicks: &[impl TimedClick],
+        organic: usize,
+        base: i64,
+        output: &mut Daily<'a>,
+    ) {
+        self.sessions.clear();
+        let mut previous = events[0].timestamp();
+        let mut session = Session {
+            start: previous,
+            day: day(previous + base),
+            revenue: 0,
+        };
+        let mut totals = new_user_day(user, session.day);
+        totals.sessions = 1;
+        for event in events {
+            let ts = event.timestamp();
+            if ts - previous > SESSION_GAP_MS {
+                self.sessions.push(session);
+                let next_day = day(ts + base);
+                if next_day != totals.day {
+                    finish_user_day(&mut totals, &mut self.categories);
+                    output.users.push(totals);
+                    totals = new_user_day(user, next_day);
+                }
+                totals.sessions += 1;
+                session = Session {
+                    start: ts,
+                    day: next_day,
+                    revenue: 0,
+                };
+            }
+            let (price, category) = event.purchase();
+            totals.events += 1;
+            if price != 0 {
+                let price = i64::from(price);
+                *self.categories.entry(category).or_default() += price;
+                totals.revenue += price;
+                session.revenue += price;
+            }
+            previous = ts;
+        }
+        self.sessions.push(session);
+        finish_user_day(&mut totals, &mut self.categories);
+        output.users.push(totals);
+
+        if clicks.is_empty() {
+            for session in &self.sessions {
+                add_credit(session, organic, &mut output.campaigns);
+            }
+        } else {
+            credit(&self.sessions, clicks, organic, &mut output.campaigns);
+            assist(
+                &self.sessions,
+                clicks,
+                &mut self.intervals,
+                &mut output.campaigns,
+            );
+        }
     }
 }
 
-fn create_sessions<'a>(
-    events: &[Event<'a>],
-    sessions: &mut Vec<Session>,
-    user_days: &mut Vec<UserDay<'a>>,
-    category_totals: &mut FxHashMap<u32, i64>,
-) {
-    sessions.clear();
-    let groups = events.chunk_by(|a, b| b.ts - a.ts <= SESSION_GAP_MS);
-    for group in groups {
-        let start = group[0].ts;
-        let session_day = day(start);
-        if user_days
-            .last()
-            .is_none_or(|row| row.user != group[0].user || row.day != session_day)
-        {
-            if let Some(row) = user_days.last_mut() {
-                finish_user_day(row, category_totals);
-            }
-            user_days.push(UserDay {
-                user: group[0].user,
-                day: session_day,
-                sessions: 0,
-                events: 0,
-                revenue: 0,
-                top_category: None,
-            });
-        }
-        sessions.push(add_session(
-            user_days.last_mut().unwrap(),
-            group,
-            category_totals,
-        ));
-    }
-    if let Some(row) = user_days.last_mut() {
-        finish_user_day(row, category_totals);
+fn new_user_day(user: UserId<'_>, day: i32) -> UserDay<'_> {
+    UserDay {
+        user,
+        day,
+        sessions: 0,
+        events: 0,
+        revenue: 0,
+        top_category: None,
     }
 }
 
@@ -118,25 +236,34 @@ fn finish_user_day(row: &mut UserDay<'_>, totals: &mut FxHashMap<u32, i64>) {
     }
 }
 
-fn credit(sessions: &[Session], clicks: &[Click<'_>], organic: usize, totals: &mut CampaignDaily) {
+fn add_credit(session: &Session, campaign: usize, totals: &mut CampaignDaily) {
+    let total = totals.at(campaign, session.day);
+    total.sessions += 1;
+    total.revenue += session.revenue;
+    total.purchasing_sessions += i64::from(session.revenue != 0);
+}
+
+fn credit<T: TimedClick>(
+    sessions: &[Session],
+    clicks: &[T],
+    organic: usize,
+    totals: &mut CampaignDaily,
+) {
     let mut next = 0;
-    let mut best: Option<&Click> = None;
+    let mut best: Option<&T> = None;
     for session in sessions {
-        while next < clicks.len() && clicks[next].ts <= session.start {
+        while next < clicks.len() && clicks[next].timestamp() <= session.start {
             let click = &clicks[next];
             // Clicks at equal timestamps are ordered by ID, so the first one wins.
-            if best.is_none_or(|previous| previous.ts < click.ts) {
+            if best.is_none_or(|previous| previous.timestamp() < click.timestamp()) {
                 best = Some(click);
             }
             next += 1;
         }
         let campaign = best
-            .filter(|click| session.start - click.ts <= WEEK_MS)
-            .map_or(organic, |click| click.campaign);
-        let total = totals.entry((campaign, session.day)).or_default();
-        total.sessions += 1;
-        total.revenue += session.revenue;
-        total.purchasing_sessions += i64::from(session.revenue != 0);
+            .filter(|click| session.start - click.timestamp() <= WEEK_MS)
+            .map_or(organic, |click| click.campaign());
+        add_credit(session, campaign, totals);
     }
 }
 
@@ -152,35 +279,32 @@ fn add_assists(
     let mut matches = &sessions[begin..end];
     while let Some(first) = matches.first() {
         let count = matches.partition_point(|session| session.day == first.day);
-        totals
-            .entry((campaign, first.day))
-            .or_default()
-            .assisted_sessions += count as i64;
+        totals.at(campaign, first.day).assisted_sessions += count as i64;
         matches = &matches[count..];
     }
 }
 
 fn assist(
     sessions: &[Session],
-    clicks: &[Click<'_>],
+    clicks: &[impl TimedClick],
     intervals: &mut FxHashMap<usize, (i64, i64)>,
     totals: &mut CampaignDaily,
 ) {
     let earliest = sessions[0].start - WEEK_MS;
     let latest = sessions.last().unwrap().start;
-    let begin = clicks.partition_point(|click| click.ts < earliest);
+    let begin = clicks.partition_point(|click| click.timestamp() < earliest);
     for click in clicks[begin..]
         .iter()
-        .take_while(|click| click.ts <= latest)
+        .take_while(|click| click.timestamp() <= latest)
     {
         let interval = intervals
-            .entry(click.campaign)
-            .or_insert((click.ts, click.ts + WEEK_MS));
-        if click.ts > interval.1 {
-            add_assists(sessions, click.campaign, interval.0, interval.1, totals);
-            interval.0 = click.ts;
+            .entry(click.campaign())
+            .or_insert((click.timestamp(), click.timestamp() + WEEK_MS));
+        if click.timestamp() > interval.1 {
+            add_assists(sessions, click.campaign(), interval.0, interval.1, totals);
+            interval.0 = click.timestamp();
         }
-        interval.1 = click.ts + WEEK_MS;
+        interval.1 = click.timestamp() + WEEK_MS;
     }
     for (campaign, (start, end)) in intervals.drain() {
         add_assists(sessions, campaign, start, end, totals);
@@ -189,9 +313,7 @@ fn assist(
 
 pub fn aggregate<'a>(events: &[Event<'a>], mut clicks: &[Click<'a>], organic: usize) -> Daily<'a> {
     let mut output = Daily::default();
-    let mut sessions = Vec::new();
-    let mut category_totals = FxHashMap::default();
-    let mut intervals = FxHashMap::default();
+    let mut scratch = Person::default();
     for events in events.chunk_by(|a, b| a.user == b.user) {
         let user = events[0].user;
         let start = clicks.partition_point(|click| click.user < user);
@@ -199,18 +321,13 @@ pub fn aggregate<'a>(events: &[Event<'a>], mut clicks: &[Click<'a>], organic: us
         let end = clicks.partition_point(|click| click.user == user);
         let (matching_clicks, remaining) = clicks.split_at(end);
         clicks = remaining;
-        create_sessions(
+        scratch.aggregate(
+            UserId::Bytes(user),
             events,
-            &mut sessions,
-            &mut output.users,
-            &mut category_totals,
-        );
-        credit(&sessions, matching_clicks, organic, &mut output.campaigns);
-        assist(
-            &sessions,
             matching_clicks,
-            &mut intervals,
-            &mut output.campaigns,
+            organic,
+            0,
+            &mut output,
         );
     }
     output
@@ -296,17 +413,14 @@ mod tests {
                     .clone()
                     .min_by_key(|click| (std::cmp::Reverse(click.ts), click.id));
                 let campaign = winner.map_or(8, |click| click.campaign);
-                let totals = expected.entry((campaign, session.day)).or_default();
+                let totals = expected.at(campaign, session.day);
                 totals.sessions += 1;
                 totals.revenue += session.revenue;
                 totals.purchasing_sessions += i64::from(session.revenue != 0);
                 let campaigns: rustc_hash::FxHashSet<_> =
                     qualifying.map(|click| click.campaign).collect();
                 for campaign in campaigns {
-                    expected
-                        .entry((campaign, session.day))
-                        .or_default()
-                        .assisted_sessions += 1;
+                    expected.at(campaign, session.day).assisted_sessions += 1;
                 }
             }
             assert_eq!(actual, expected, "round {round}");

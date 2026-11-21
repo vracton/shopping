@@ -11,7 +11,7 @@ use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 
 use crate::Result;
-use crate::aggregate::{CampaignDaily, Daily, UserDay};
+use crate::aggregate::{CampaignStats, Daily, UserDay, UserId};
 use crate::catalog::Catalog;
 
 fn user_schema() -> SchemaRef {
@@ -58,10 +58,13 @@ fn user_batch(
     catalog: &Catalog<'_>,
     schema: SchemaRef,
 ) -> Result<RecordBatch> {
-    let mut user = StringBuilder::new();
-    let mut category = StringBuilder::new();
+    let mut user = StringBuilder::with_capacity(rows.len(), rows.len() * 9);
+    let mut category = StringBuilder::with_capacity(rows.len(), rows.len());
     for row in rows {
-        user.append_value(std::str::from_utf8(row.user)?);
+        match row.user {
+            UserId::Bytes(value) => user.append_value(std::str::from_utf8(value)?),
+            UserId::Packed(value) => user.append_value(value.decode(&mut [0; 9])),
+        }
         match row.top_category {
             Some(index) => {
                 category.append_value(std::str::from_utf8(catalog.categories[index as usize])?)
@@ -138,14 +141,12 @@ fn write_campaigns(
     catalog: &Catalog<'_>,
     row_group: usize,
 ) -> Result<()> {
-    let mut totals = CampaignDaily::default();
+    let mut totals: rustc_hash::FxHashMap<_, CampaignStats> = rustc_hash::FxHashMap::default();
     for part in partitions {
-        for (&key, stats) in &part.campaigns {
-            *totals.entry(key).or_default() += stats.clone();
-        }
+        part.campaigns
+            .for_each(|key, stats| *totals.entry(key).or_default() += stats);
     }
-    let mut rows: Vec<_> = totals.into_iter().collect();
-    rows.sort_unstable_by_key(|row| row.0);
+    let rows: Vec<_> = totals.into_iter().collect();
     let schema = campaign_schema();
     let mut writer = file_writer(&path.join("part-0.parquet"), Arc::clone(&schema), row_group)?;
     for rows in rows.chunks(row_group) {

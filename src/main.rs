@@ -3,6 +3,7 @@ mod catalog;
 mod ingest;
 mod input;
 mod output;
+mod packed;
 mod stages;
 
 use std::env;
@@ -18,7 +19,7 @@ use serde_json::Value;
 use crate::aggregate::{Daily, aggregate, split_ordered};
 use crate::catalog::Catalog;
 use crate::ingest::InputRows;
-use crate::input::{chunks, map_file, map_shards, timestamp};
+use crate::input::{chunks, map_file, map_shards, read_shards, timestamp};
 use crate::stages::Stages;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -26,6 +27,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 enum Architecture {
     Sort,
     Hash,
+    Packed,
 }
 
 struct Config {
@@ -35,6 +37,7 @@ struct Config {
     workers: usize,
     chunk_bytes: usize,
     partitions: usize,
+    dedup_partitions: usize,
     parquet_rows: usize,
 }
 
@@ -44,18 +47,20 @@ impl Config {
             .map(usize::from)
             .unwrap_or(1);
         let workers = positive_setting("NCPU", available.min(8))?;
-        let architecture = match env::var("SHOPPING_ARCH").as_deref().unwrap_or("hash") {
+        let architecture = match env::var("SHOPPING_ARCH").as_deref().unwrap_or("packed") {
             "sort" => Architecture::Sort,
             "hash" => Architecture::Hash,
+            "packed" => Architecture::Packed,
             value => {
-                return Err(
-                    format!("invalid SHOPPING_ARCH {value:?}, expected sort or hash").into(),
-                );
+                return Err(format!(
+                    "invalid SHOPPING_ARCH {value:?}, expected packed, sort or hash"
+                )
+                .into());
             }
         };
         let (chunk_kib, partitions, parquet_rows) = match architecture {
             Architecture::Sort => (4096, 32, 65_536),
-            Architecture::Hash => (2048, 64, 16_384),
+            Architecture::Hash | Architecture::Packed => (2048, 64, 16_384),
         };
         Ok(Self {
             data: env::var_os("DATA_DIR").map_or_else(|| PathBuf::from("/data"), PathBuf::from),
@@ -67,6 +72,7 @@ impl Config {
                 .checked_mul(1024)
                 .ok_or("SHOPPING_CHUNK_KIB is too large")?,
             partitions: positive_setting("SHOPPING_PARTITIONS", partitions)?,
+            dedup_partitions: positive_setting("SHOPPING_DEDUP_PARTITIONS", 64)?,
             parquet_rows: positive_setting("SHOPPING_PARQUET_ROWS", parquet_rows)?,
         })
     }
@@ -106,16 +112,59 @@ fn run(config: &Config) -> Result<()> {
     let links = map_shards(&config.data.join("links"))?;
     let products = map_file(&config.data.join("products.csv"))?;
     let campaigns = map_file(&config.data.join("campaigns.csv"))?;
+    let buffered = match env::var("SHOPPING_IO").as_deref().unwrap_or("mmap") {
+        "mmap" => false,
+        "buffered" => true,
+        value => {
+            return Err(format!("invalid SHOPPING_IO {value:?}, expected mmap or buffered").into());
+        }
+    };
+    let (event_maps, click_maps) = rayon::join(
+        || read_shards(&config.data.join("events"), buffered),
+        || read_shards(&config.data.join("clicks"), buffered),
+    );
+    let (event_maps, click_maps) = (event_maps?, click_maps?);
+    let event_chunks = chunks(&event_maps, config.chunk_bytes);
+    let click_chunks = chunks(&click_maps, config.chunk_bytes);
+    stages.mark("setup");
+    if matches!(config.architecture, Architecture::Packed) {
+        let catalog = Catalog::new(
+            std::iter::empty(),
+            products.as_deref().unwrap_or_default(),
+            campaigns.as_deref().unwrap_or_default(),
+        );
+        if let Some(parsed) = packed::parse_inputs(
+            &event_chunks,
+            &click_chunks,
+            links.iter().map(|mapping| &mapping[..]),
+            &catalog,
+            window.clone(),
+            config.partitions,
+            config.dedup_partitions,
+        ) {
+            stages.mark("packed_parse_and_links");
+            drop((event_chunks, click_chunks));
+            let ((), daily) = rayon::join(
+                || drop((event_maps, click_maps, links)),
+                || parsed.aggregate(config.partitions, catalog.organic, &mut stages),
+            );
+            stages.mark("packed_order_and_aggregate");
+            output::write(
+                &config.output,
+                &daily,
+                &catalog,
+                config.workers,
+                config.parquet_rows,
+            )?;
+            stages.mark("parquet");
+            return Ok(());
+        }
+    }
     let catalog = Catalog::new(
         links.iter().map(|mapping| &mapping[..]),
         products.as_deref().unwrap_or_default(),
         campaigns.as_deref().unwrap_or_default(),
     );
-    let event_maps = map_shards(&config.data.join("events"))?;
-    let click_maps = map_shards(&config.data.join("clicks"))?;
-    let event_chunks = chunks(&event_maps, config.chunk_bytes);
-    let click_chunks = chunks(&click_maps, config.chunk_bytes);
-    stages.mark("setup");
     let input = InputRows {
         event_chunks: &event_chunks,
         click_chunks: &click_chunks,
@@ -131,7 +180,7 @@ fn run(config: &Config) -> Result<()> {
                 .map(|(events, clicks)| aggregate(events, clicks, catalog.organic))
                 .collect()
         }
-        Architecture::Hash => input
+        Architecture::Hash | Architecture::Packed => input
             .hash(config.partitions, &mut stages)
             .into_par_iter()
             .map(|batch| aggregate(&batch.events, &batch.clicks, catalog.organic))

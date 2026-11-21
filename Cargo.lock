@@ -613,6 +613,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "hashbrown",
  "memchr",
  "memmap2",
  "parquet",
