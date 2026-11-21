@@ -5,6 +5,9 @@ use rustc_hash::FxHashMap;
 use crate::ingest::{Batches, Click, Event};
 use crate::input::{DAY_MS, WEEK_MS};
 
+#[path = "aggregate_cells.rs"]
+mod cells;
+
 const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 #[derive(Debug, PartialEq, Eq)]
 pub enum CampaignDaily {
@@ -195,14 +198,35 @@ pub struct Person {
     intervals: FxHashMap<usize, (i64, i64)>,
     bins: TimeBins,
     assist_ends: Option<Vec<usize>>,
+    cells: Option<cells::Cells>,
 }
 
 impl Person {
     pub fn with_assist_sweep(campaigns: usize) -> Self {
         Self {
             assist_ends: Some(vec![0; campaigns]),
+            cells: std::env::var_os("SHOPPING_SESSIONIZER")
+                .is_some_and(|s| s == "cells")
+                .then(cells::Cells::default),
             ..Self::default()
         }
+    }
+
+    pub fn try_cells<'a>(
+        &mut self,
+        user: UserId<'a>,
+        events: &[impl TimedEvent],
+        clicks: &[impl TimedClick],
+        organic: usize,
+        base: i64,
+        output: &mut Daily<'a>,
+    ) -> bool {
+        let Some(cells) = &mut self.cells else {
+            return false;
+        };
+        cells.run(&mut self.sessions, user, events, base, output);
+        self.finish_campaigns(clicks, organic, &mut output.campaigns);
+        true
     }
 
     pub fn aggregate<'a>(
@@ -536,6 +560,10 @@ mod tests {
         };
         let mut first = Person::default();
         let mut second = Person::default();
+        let mut third = Person {
+            cells: Some(cells::Cells::default()),
+            ..Person::default()
+        };
         for round in 0..160_u64 {
             let mut events: Vec<_> = (0..round + 1)
                 .map(|_| {
@@ -568,6 +596,8 @@ mod tests {
                 base,
                 &mut unordered,
             );
+            let mut compact = Daily::default();
+            assert!(third.try_cells(UserId::Bytes(b"u"), &events, &clicks, 5, base, &mut compact));
             events.sort_unstable_by_key(|event| event.ts);
             second.aggregate(UserId::Bytes(b"u"), &events, &clicks, 5, base, &mut sorted);
             let summarize = |out: &Daily| {
@@ -586,6 +616,8 @@ mod tests {
             };
             assert_eq!(summarize(&unordered), summarize(&sorted), "round {round}");
             assert_eq!(unordered.campaigns, sorted.campaigns, "round {round}");
+            assert_eq!(summarize(&compact), summarize(&sorted), "round {round}");
+            assert_eq!(compact.campaigns, sorted.campaigns, "round {round}");
         }
     }
 
