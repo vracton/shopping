@@ -104,76 +104,7 @@ impl ClaimBatch {
                 .ts
                 .store(INVALID, Relaxed);
         };
-        let screen = std::env::var_os("SHOPPING_CLAIMS").is_some_and(|s| s == "screen");
-        claims.into_par_iter().for_each(|groups| {
-            let n: usize = groups.iter().map(Vec::len).sum();
-            if n == 0 {
-                return;
-            }
-            let mut conflicts = Vec::new();
-            let capacity = if screen {
-                // A single sighting in this bitmap proves that no other row
-                // can have the same full key. All remaining rows still use
-                // the full-key contest below.
-                let words = n.div_ceil(4).next_power_of_two();
-                let mut seen = vec![0u64; words];
-                conflicts.resize(words, 0);
-                for &entry in groups.iter().flatten() {
-                    let h = (entry >> 32) as usize;
-                    let word = (h >> 6) & (words - 1);
-                    let bit = 1u64 << (h & 63);
-                    let old = seen[word];
-                    conflicts[word] |= old & bit;
-                    seen[word] = old | bit;
-                }
-                // Exact slot capacity must fit even a pathological set of
-                // different keys mapped onto one bit.
-                groups
-                    .iter()
-                    .flatten()
-                    .filter(|&&entry| {
-                        let h = (entry >> 32) as usize;
-                        conflicts[(h >> 6) & (words - 1)] >> (h & 63) & 1 != 0
-                    })
-                    .count()
-            } else {
-                n
-            };
-            let mut slots = vec![0_u64; (capacity + capacity / 2 + 1).next_power_of_two()];
-            let mask = slots.len() - 1;
-            for entry in groups.into_iter().flatten() {
-                if screen {
-                    let h = (entry >> 32) as usize;
-                    if conflicts[(h >> 6) & (conflicts.len() - 1)] >> (h & 63) & 1 == 0 {
-                        continue;
-                    }
-                }
-                let mut pos = (entry >> 32) as usize & mask;
-                loop {
-                    let old = slots[pos];
-                    if old == 0 {
-                        slots[pos] = entry;
-                        break;
-                    }
-                    // The upper word is only a fingerprint. Full keys decide identity.
-                    if (old ^ entry) >> 32 == 0 {
-                        let a = old as u32 - 1;
-                        let b = entry as u32 - 1;
-                        let (prev, new) = (lookup(a), lookup(b));
-                        if prev.0 == new.0 {
-                            if prev.1 > new.1 {
-                                reject(a);
-                                slots[pos] = entry;
-                            } else {
-                                reject(b);
-                            }
-                            break;
-                        }
-                    }
-                    pos = (pos + 1) & mask;
-                }
-            }
-        });
+        mark_claims(claims, lookup, reject);
         drop(metadata);
         let parts = events
             .into_par_iter()
@@ -193,6 +124,84 @@ impl ClaimBatch {
             .collect();
         transpose(parts, count)
     }
+}
+
+/// A fingerprint can prove absence, but its exact witness decides identity and order.
+pub(super) fn mark_claims(
+    claims: Vec<Vec<Vec<u64>>>,
+    lookup: impl Fn(u32) -> (Key, u64) + Sync,
+    reject: impl Fn(u32) + Sync,
+) {
+    let screen = std::env::var_os("SHOPPING_CLAIMS").is_some_and(|s| s == "screen");
+    claims.into_par_iter().for_each(|groups| {
+        let n: usize = groups.iter().map(Vec::len).sum();
+        if n == 0 {
+            return;
+        }
+        let mut conflicts = Vec::new();
+        let capacity = if screen {
+            // A single sighting in this bitmap proves that no other row
+            // can have the same full key. All remaining rows still use
+            // the full-key contest below.
+            let words = n.div_ceil(4).next_power_of_two();
+            let mut seen = vec![0u64; words];
+            conflicts.resize(words, 0);
+            for &entry in groups.iter().flatten() {
+                let h = (entry >> 32) as usize;
+                let word = (h >> 6) & (words - 1);
+                let bit = 1u64 << (h & 63);
+                let old = seen[word];
+                conflicts[word] |= old & bit;
+                seen[word] = old | bit;
+            }
+            // Exact slot capacity must fit even a pathological set of
+            // different keys mapped onto one bit.
+            groups
+                .iter()
+                .flatten()
+                .filter(|&&entry| {
+                    let h = (entry >> 32) as usize;
+                    conflicts[(h >> 6) & (words - 1)] >> (h & 63) & 1 != 0
+                })
+                .count()
+        } else {
+            n
+        };
+        let mut slots = vec![0_u64; (capacity + capacity / 2 + 1).next_power_of_two()];
+        let mask = slots.len() - 1;
+        for entry in groups.into_iter().flatten() {
+            if screen {
+                let h = (entry >> 32) as usize;
+                if conflicts[(h >> 6) & (conflicts.len() - 1)] >> (h & 63) & 1 == 0 {
+                    continue;
+                }
+            }
+            let mut pos = (entry >> 32) as usize & mask;
+            loop {
+                let old = slots[pos];
+                if old == 0 {
+                    slots[pos] = entry;
+                    break;
+                }
+                // The upper word is only a fingerprint. Full keys decide identity.
+                if (old ^ entry) >> 32 == 0 {
+                    let a = old as u32 - 1;
+                    let b = entry as u32 - 1;
+                    let (prev, new) = (lookup(a), lookup(b));
+                    if prev.0 == new.0 {
+                        if prev.1 > new.1 {
+                            reject(a);
+                            slots[pos] = entry;
+                        } else {
+                            reject(b);
+                        }
+                        break;
+                    }
+                }
+                pos = (pos + 1) & mask;
+            }
+        }
+    });
 }
 
 #[cfg(test)]

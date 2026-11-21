@@ -17,6 +17,8 @@ mod split;
 
 #[path = "packed_claims.rs"]
 mod claims;
+#[path = "packed_source_claims.rs"]
+mod source_claims;
 
 const INVALID: u32 = u32::MAX;
 const PRICE_MASK: u32 = (1 << 24) - 1;
@@ -984,6 +986,7 @@ fn aggregate_sorted(
 }
 
 enum EventInput {
+    SourceClaims(source_claims::SourceEvents),
     Claims(claims::ClaimBatch),
     ById(Vec<Vec<Vec<Candidate>>>),
     ByPerson(split::SplitEvents),
@@ -1109,6 +1112,17 @@ pub fn parse_inputs(
                                 && std::env::var_os("SHOPPING_DEDUP_MODE")
                                     .is_some_and(|m| m == "claims")
                             {
+                                if std::env::var_os("SHOPPING_CLAIM_EVIDENCE")
+                                    .is_some_and(|mode| mode == "source")
+                                {
+                                    return source_claims::SourceEvents::parse(
+                                        events,
+                                        dedup_count,
+                                        &parser,
+                                        window_rows,
+                                    )
+                                    .map(EventInput::SourceClaims);
+                                }
                                 return claims::ClaimBatch::parse(
                                     events,
                                     dedup_count,
@@ -1174,6 +1188,7 @@ impl Parsed {
             || {
                 Stages::span(profile, "event_dedup_and_route", || match events {
                     EventInput::Claims(batch) => batch.route(&links, count),
+                    EventInput::SourceClaims(batch) => batch.route(&links, count),
                     EventInput::ByPerson(routed) => routed.winners(count, profile),
                     EventInput::ById(groups) => {
                         let parts = groups
