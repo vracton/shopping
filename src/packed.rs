@@ -19,6 +19,8 @@ mod split;
 mod claims;
 #[path = "packed_fused.rs"]
 mod fused;
+#[path = "packed_precheck.rs"]
+mod precheck;
 #[path = "packed_sketch.rs"]
 mod sketch;
 
@@ -332,14 +334,20 @@ impl Parser<'_, '_> {
     }
 
     #[inline(always)]
-    fn event(
+    fn event(&self, fields: [&[u8]; 7]) -> Option<Option<Candidate>> {
+        self.event_with_key(fields, Key::pack)
+    }
+
+    #[inline(always)]
+    fn event_with_key(
         &self,
         [id, user, ts, ingest, kind, product, price]: [&[u8]; 7],
+        key: impl FnOnce(&[u8]) -> Option<Key>,
     ) -> Option<Option<Candidate>> {
         if id.is_empty() {
             return Some(None);
         }
-        let event = Key::pack(id)?;
+        let event = key(id)?;
         let code = if self.fast_time.is_some() {
             FastTime::ingest(ingest)
         } else {
@@ -988,6 +996,7 @@ fn aggregate_sorted(
 }
 
 enum EventInput {
+    Winners(Vec<Vec<Vec<Event>>>),
     Sketch(sketch::Batch),
     Fused(fused::Batch),
     Claims(claims::ClaimBatch),
@@ -1101,7 +1110,21 @@ pub fn parse_inputs(
     let fused_mode = indexed
         .then(|| std::env::var("SHOPPING_FUSED").ok())
         .flatten();
-    let (events, clicks, links) = if fused_mode.as_deref() == Some("canonical") {
+    let (events, clicks, links) = if fused_mode.as_deref() == Some("precheck") {
+        let (screen, (links, clicks)) = rayon::join(
+            || {
+                Stages::span(profile, "id_precheck", || {
+                    precheck::Screen::build(events, dedup_count)
+                })
+            },
+            || rayon::join(decode_links, decode_clicks),
+        );
+        let links = links?;
+        let events = Stages::span(profile, "prechecked_event_decode", || {
+            screen?.decode(events, &parser, &links, count, dedup_count, window_rows)
+        })?;
+        (EventInput::Winners(events), clicks?, links)
+    } else if fused_mode.as_deref() == Some("canonical") {
         let (links, clicks) = rayon::join(decode_links, decode_clicks);
         let links = links?;
         let batch = fused::Batch::parse(
@@ -1215,6 +1238,7 @@ impl Parsed {
         let (events, clicks) = rayon::join(
             || {
                 Stages::span(profile, "event_dedup_and_route", || match events {
+                    EventInput::Winners(parts) => parts,
                     EventInput::Sketch(batch) => batch.route(&links, count),
                     EventInput::Fused(batch) => batch.finish(&links, count),
                     EventInput::Claims(batch) => batch.route(&links, count),
